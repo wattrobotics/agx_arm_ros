@@ -21,6 +21,12 @@
     <xacro:include filename="$(find agx_arm_description)/agx_arm_urdf/$(arg arm_type)/urdf/$(arg arm_type)_with_right_revo2_description.xacro" />
   </xacro:if>
 
+  <!-- Hand-eye variant: arm + gripper_flange + fixed camera mount (no actuated joints).
+       Currently authored only for nero (see nero_with_handeye_description.xacro). -->
+  <xacro:if value="$(eval effector_type == 'handeye')">
+    <xacro:include filename="$(find agx_arm_description)/agx_arm_urdf/$(arg arm_type)/urdf/$(arg arm_type)_with_handeye_description.xacro" />
+  </xacro:if>
+
   <xacro:if value="$(eval effector_type == 'none')">
     <xacro:include filename="$(find agx_arm_description)/agx_arm_urdf/$(arg arm_type)/urdf/$(arg arm_type)_description.urdf" />
   </xacro:if>

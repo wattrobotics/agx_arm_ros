@@ -5,7 +5,9 @@ from launch.substitutions import LaunchConfiguration
 from moveit_configs_utils import MoveItConfigsBuilder
 
 ALL_ARM_TYPES = ["piper", "piper_x", "piper_l", "piper_h", "nero"]
-ALL_EFFECTOR_TYPES = ["none", "agx_gripper", "revo2"]
+# `handeye` adds only fixed frames (no actuated joints), so it reuses the
+# `none` controller profile via _select_profile(). Currently nero-only.
+ALL_EFFECTOR_TYPES = ["none", "agx_gripper", "revo2", "handeye"]
 ALL_REVO2_TYPES = ["left", "right"]
 
 

@@ -32,6 +32,22 @@ ROBOT_WITH_REVO2_URDF_MAP = {
     for arm_type in ARM_TYPES
 }
 
+# Flange-only variants (arm + connecting flange link, no end-effector body).
+# Currently authored only for `nero`; other arm_types will raise at resolve time.
+ROBOT_WITH_GRIPPER_FLANGE_URDF_MAP = {
+    'nero': 'nero/urdf/nero_with_gripper_flange_description.xacro',
+}
+
+ROBOT_WITH_REVO2_FLANGE_URDF_MAP = {
+    'nero': 'nero/urdf/nero_with_revo2_flange_description.xacro',
+}
+
+# Hand-eye variant (arm + gripper_flange + end point + hand-eye camera).
+# Currently authored only for `nero`; other arm_types will raise at resolve time.
+ROBOT_WITH_HANDEYE_URDF_MAP = {
+    'nero': 'nero/urdf/nero_with_handeye_description.xacro',
+}
+
 
 def _resolve_custom_model_path(pkg_path, custom_model):
     # 1) 尝试在 agx_arm_urdf/ 下按相对路径解析
@@ -49,6 +65,27 @@ def _resolve_builtin_model_path(arm_type, effector_type, revo2_type, pkg_path):
         relative_path = ROBOT_WITH_GRIPPER_URDF_MAP[arm_type]
     elif effector_type == 'revo2':
         relative_path = ROBOT_WITH_REVO2_URDF_MAP[arm_type][revo2_type]
+    elif effector_type == 'gripper_flange':
+        if arm_type not in ROBOT_WITH_GRIPPER_FLANGE_URDF_MAP:
+            raise RuntimeError(
+                f"effector_type=gripper_flange is not available for arm_type={arm_type}; "
+                f"only {sorted(ROBOT_WITH_GRIPPER_FLANGE_URDF_MAP)} provide a flange-only xacro."
+            )
+        relative_path = ROBOT_WITH_GRIPPER_FLANGE_URDF_MAP[arm_type]
+    elif effector_type == 'revo2_flange':
+        if arm_type not in ROBOT_WITH_REVO2_FLANGE_URDF_MAP:
+            raise RuntimeError(
+                f"effector_type=revo2_flange is not available for arm_type={arm_type}; "
+                f"only {sorted(ROBOT_WITH_REVO2_FLANGE_URDF_MAP)} provide a flange-only xacro."
+            )
+        relative_path = ROBOT_WITH_REVO2_FLANGE_URDF_MAP[arm_type]
+    elif effector_type == 'handeye':
+        if arm_type not in ROBOT_WITH_HANDEYE_URDF_MAP:
+            raise RuntimeError(
+                f"effector_type=handeye is not available for arm_type={arm_type}; "
+                f"only {sorted(ROBOT_WITH_HANDEYE_URDF_MAP)} provide a hand-eye xacro."
+            )
+        relative_path = ROBOT_WITH_HANDEYE_URDF_MAP[arm_type]
     else:
         relative_path = ROBOT_URDF_MAP[arm_type]
     return str(pkg_path / 'agx_arm_urdf' / relative_path)
@@ -207,8 +244,10 @@ def generate_launch_description():
     effector_type_arg = DeclareLaunchArgument(
         name='effector_type',
         default_value='none',
-        choices=['none', 'agx_gripper', 'revo2'],
-        description='End effector type (e.g. agx_gripper, revo2).'
+        choices=['none', 'agx_gripper', 'revo2', 'gripper_flange', 'revo2_flange', 'handeye'],
+        description='End effector type. Use `gripper_flange` or `revo2_flange` to show '
+                    'only the connecting flange (no end-effector body); use `handeye` for '
+                    'the end point + hand-eye camera variant; flange/handeye are currently nero-only.'
     )
     revo2_type_arg = DeclareLaunchArgument(
         'revo2_type',

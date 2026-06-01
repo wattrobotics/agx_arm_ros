@@ -343,6 +343,16 @@
     </xacro:unless>
   </xacro:if>
 
+  <!-- ======================== HAND-EYE (fixed camera mount) ======================== -->
+  <!-- handeye adds only fixed frames (gripper_flange + camera mount), no actuated joints,
+       so there is no planning group/eef here, only collision disabling for the fixed chain. -->
+  <xacro:if value="$(eval effector_type == 'handeye')">
+    <disable_collisions link1="gripper_flange" link2="link7" reason="Adjacent" />
+    <disable_collisions link1="endeffector_base_link" link2="gripper_flange" reason="Adjacent" />
+    <disable_collisions link1="end_point_link" link2="endeffector_base_link" reason="Adjacent" />
+    <disable_collisions link1="hand_eye_camera_link" link2="endeffector_base_link" reason="Adjacent" />
+  </xacro:if>
+
   <!-- ======================== HOME STATE ======================== -->
   <xacro:unless value="$(eval arm_type == 'nero')">
     <group_state name="home" group="arm">
