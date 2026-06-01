@@ -1,4 +1,4 @@
 [submodule "src/agx_arm_description/agx_arm_urdf"]
 	path = src/agx_arm_description/agx_arm_urdf
-	url = https://github.com/agilexrobotics/agx_arm_urdf.git
+	url = https://github.com/wattrobotics/agx_arm_urdf.git
 	branch = main
