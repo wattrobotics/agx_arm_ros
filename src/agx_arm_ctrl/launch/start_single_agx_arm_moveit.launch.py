@@ -39,8 +39,8 @@ def generate_launch_description():
     effector_type_arg = DeclareLaunchArgument(
         'effector_type',
         default_value='none',
-        choices=['none', 'agx_gripper', 'revo2'],
-        description='End effector type (e.g. agx_gripper, revo2).'
+        choices=['none', 'agx_gripper', 'revo2', 'handeye'],
+        description='End effector type (e.g. agx_gripper, revo2, handeye).'
     )
 
     revo2_type_arg = DeclareLaunchArgument(
