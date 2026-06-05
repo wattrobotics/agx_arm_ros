@@ -99,25 +99,28 @@ def _build_ros2_controllers_file(arm_type, effector_type, revo2_type, namespace)
     return tmp.name
 
 
-def _build_namespaced_moveit_rviz_config(package_path, namespace):
-    """Generate a temporary RViz config with namespace-specific MoveGroup target."""
+def _resolve_moveit_rviz_config(package_path, namespace):
+    """Return an RViz config path with the namespace-specific MoveGroup target.
+
+    With no namespace the committed ``config/moveit.rviz`` is used as-is, so we
+    do not litter ``/tmp`` with a fresh copy on every launch. When a namespace
+    is given the config is written to a deterministic per-namespace path that is
+    overwritten in place, so at most one file exists per namespace.
+    """
     base_rviz = package_path / "config/moveit.rviz"
-    content = base_rviz.read_text(encoding="utf-8")
 
     ns = namespace.strip("/")
-    move_group_ns = f"/{ns}" if ns else ""
+    if not ns:
+        return str(base_rviz)
 
-    content = content.replace(
+    content = base_rviz.read_text(encoding="utf-8").replace(
         'Move Group Namespace: ""',
-        f'Move Group Namespace: "{move_group_ns}"',
+        f'Move Group Namespace: "/{ns}"',
     )
 
-    tmp = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".rviz", prefix="moveit_", delete=False
-    )
-    tmp.write(content)
-    tmp.close()
-    return tmp.name
+    out_path = Path(tempfile.gettempdir()) / f"agx_arm_moveit_{ns}.rviz"
+    out_path.write_text(content, encoding="utf-8")
+    return str(out_path)
 
 
 def _build_moveit(context):
@@ -176,7 +179,7 @@ def _build_moveit(context):
                 str(package_path / "launch/moveit_rviz.launch.py")
             ),
             launch_arguments={
-                "rviz_config": _build_namespaced_moveit_rviz_config(package_path, namespace),
+                "rviz_config": _resolve_moveit_rviz_config(package_path, namespace),
             }.items(),
             condition=IfCondition(LaunchConfiguration("use_rviz")),
         )
