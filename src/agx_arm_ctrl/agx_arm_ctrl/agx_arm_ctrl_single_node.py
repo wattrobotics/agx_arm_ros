@@ -22,6 +22,9 @@ from agx_arm_ctrl.effector import AgxGripperWrapper, Revo2Wrapper
 
 GRIPPER_JOINT_NAME = "gripper"
 
+# rad; limit에 정확히 걸치는 것을 피하려면 작은 안쪽 여유값을 줄 수 있음
+JOINT_LIMIT_MARGIN = 0.01
+
 REVO2_FINGER_CONFIG = [
     # (joint_name, attribute_name, max_angle)
     ("thumb_metacarpal_joint", "thumb_base", 1.57),
@@ -63,6 +66,10 @@ class AgxArmRosNode(Node):
         ### effector
         self._init_effector()
 
+        ### startup joint-limit clip
+        if self.enforce_joint_limits_on_start:
+            self.clip_joint_limit()
+
         ### publishers
         self._setup_publishers()
 
@@ -90,6 +97,7 @@ class AgxArmRosNode(Node):
         self.declare_parameter("gripper_default_effort", 1.0)
         self.declare_parameter("publish_gripper_joint", True)
         self.declare_parameter("control_enabled", True)
+        self.declare_parameter("enforce_joint_limits_on_start", True)
 
     def _load_parameters(self):
         self.can_port = self.get_parameter("can_port").value
@@ -104,6 +112,7 @@ class AgxArmRosNode(Node):
         self.gripper_default_effort = self.get_parameter("gripper_default_effort").value
         self.publish_gripper_joint = self.get_parameter("publish_gripper_joint").value
         self.control_enabled = self.get_parameter("control_enabled").value
+        self.enforce_joint_limits_on_start = self.get_parameter("enforce_joint_limits_on_start").value
 
         if self.arm_type not in ArmModel.__dict__.values():
             self.get_logger().error(
@@ -127,8 +136,12 @@ class AgxArmRosNode(Node):
         self.control_ready = False
         self._control_ready_logged = False
         self.arm_joint_names = list()
+        self.arm_joint_limits = list()
         self.arm_joint_count = 0
         self._control_gate_block_logged = False
+        self.drag_mode_active = False         # 끌리는 모드(leader zero-force drag) 활성 여부
+        self._drag_exit_use_follower = False  # 해제 시 follower 모드 사용(nero >= 1.12)
+        self._drag_mode_block_logged = False  # 드래그 중 제어 차단 로그 1회용
 
     def _log_parameters(self):
         self.get_logger().info(f"can_port: {self.can_port}")
@@ -143,6 +156,7 @@ class AgxArmRosNode(Node):
         self.get_logger().info(f"gripper_default_effort: {self.gripper_default_effort}")
         self.get_logger().info(f"publish_gripper_joint: {self.publish_gripper_joint}")
         self.get_logger().info(f"control_enabled: {self.control_enabled}")
+        self.get_logger().info(f"enforce_joint_limits_on_start: {self.enforce_joint_limits_on_start}")
 
     def _init_agx_arm(self):
         config: PiperCanDefaultConfig = create_agx_arm_config(
@@ -152,6 +166,7 @@ class AgxArmRosNode(Node):
         self.agx_arm.connect()
 
         self.arm_joint_names = list(config["joint_limits"].keys())
+        self.arm_joint_limits = list(config["joint_limits"].values())  # 관절 순서의 [[min, max], ...]
         self.arm_joint_count = self.agx_arm.joint_nums
 
         if self.auto_enable:
@@ -184,7 +199,10 @@ class AgxArmRosNode(Node):
                     firmeware_version = NeroFW.V111
                 elif current_version >= "1.12":
                     firmeware_version = NeroFW.V112
-            
+                # nero >= 1.12는 leader 모드 해제 시 set_follower_mode 사용
+                # (set_normal_mode은 no-op). piper/nero <= 1.11은 set_normal_mode.
+                self._drag_exit_use_follower = current_version >= "1.12"
+
             if firmeware_version != PiperFW.DEFAULT:
                 self.agx_arm.disconnect()
                 config = create_agx_arm_config(
@@ -278,6 +296,7 @@ class AgxArmRosNode(Node):
     def _setup_services(self):
         self.create_service(SetBool, "enable_agx_arm", self._enable_callback)
         self.create_service(SetBool, "control_enable", self._control_gate_callback)
+        self.create_service(SetBool, "drag_mode", self._drag_mode_callback)
         self.create_service(Empty, "move_home", self._move_home_callback)
         self.create_service(Empty, "emergency_stop", self._emergency_stop_callback)
         if not self.is_switch_seamlessly:
@@ -307,6 +326,12 @@ class AgxArmRosNode(Node):
         if not self.control_ready:
             # Startup warm-up: ignore incoming control commands until a valid
             # joint state stream is available.
+            return False
+        if self.drag_mode_active:
+            # 사람이 손으로 끄는 동안에는 제어 명령을 무시한다.
+            if not self._drag_mode_block_logged:
+                self.get_logger().info("Drag mode active, ignore control commands")
+                self._drag_mode_block_logged = True
             return False
         if not self._check_arm_ready():
             self.get_logger().warn("Agx_arm is not connected, cannot control")
@@ -385,6 +410,77 @@ class AgxArmRosNode(Node):
             )
         
         return True
+
+    def _set_normal_control_mode(self) -> None:
+        """leader(드래그) 모드에서 정상 CAN 제어 모드로 복귀한다.
+
+        펌웨어 >= 1.12(nero)는 set_follower_mode, 그 외(piper/nero <= 1.11)는
+        set_normal_mode을 사용한다.
+        """
+        if self._drag_exit_use_follower:
+            self.agx_arm.set_follower_mode()
+        else:
+            self.agx_arm.set_normal_mode()
+
+    def clip_joint_limit(self) -> None:
+        """현재 관절 각도를 읽어, joint limit을 벗어난 관절을 limit 안쪽으로 move_j로 보정한다.
+
+        자기완결형 메소드로, 피드백/enable/teach 모드를 직접 확인한 뒤 동작한다.
+        """
+        # 관절 피드백이 들어올 때까지 제한 대기
+        start_time = time.time()
+        while not self._check_arm_ready():
+            if time.time() - start_time > self.enable_timeout:
+                self.get_logger().warn(
+                    "No joint feedback available, skip startup joint-limit clip"
+                )
+                return
+            # time.sleep(0.01)
+
+        if not self.enable_flag:
+            self.get_logger().warn(
+                "Agx_arm is not enabled, joint-limit clip command will not apply, skip"
+            )
+            return
+
+        if not self.is_switch_seamlessly:
+            arm_status = self.agx_arm.get_arm_status()
+            if arm_status is not None and arm_status.msg.ctrl_mode == self.agx_arm.ARM_STATUS.CtrlMode.TEACHING_MODE:
+                self.get_logger().warn(
+                    "Agx_arm is in teach mode, skip startup joint-limit clip"
+                )
+                return
+
+        js = self.agx_arm.get_joint_angles()
+        if js is None or js.hz <= 0:
+            self.get_logger().warn("No valid joint angles, skip startup joint-limit clip")
+            return
+
+        current = list(js.msg)
+        target = list(current)
+        violations = []
+        for idx, (name, (lo, hi)) in enumerate(zip(self.arm_joint_names, self.arm_joint_limits)):
+            if idx >= len(current):
+                break
+            clamped = min(max(current[idx], lo + JOINT_LIMIT_MARGIN), hi - JOINT_LIMIT_MARGIN)
+            if clamped != current[idx]:
+                violations.append((name, current[idx], clamped, lo, hi))
+                target[idx] = clamped
+
+        if not violations:
+            self.get_logger().info("All joints are within limits at startup")
+            return
+
+        for name, cur, clamped, lo, hi in violations:
+            self.get_logger().warn(
+                f"Joint '{name}' out of limit: {cur:.4f} rad not in [{lo:.4f}, {hi:.4f}], "
+                f"moving to {clamped:.4f} rad"
+            )
+
+        self.agx_arm.move_j(target)
+        self.is_mit_mode = False
+        if self._wait_motion_done():
+            self.get_logger().info("Startup joint-limit clip completed")
 
     ### publisher thread
     def _publish_thread(self):
@@ -856,6 +952,8 @@ class AgxArmRosNode(Node):
                 self.get_logger().warn("Agx_arm is not connected, cannot move to home position")
             elif not self.enable_flag:
                 self.get_logger().warn("Agx_arm is not enabled, cannot move to home position")
+            elif self.drag_mode_active:
+                self.get_logger().warn("Drag mode is active, disable it before move to home position")
             else:
                 if not self.is_switch_seamlessly:
                     arm_status = self.agx_arm.get_arm_status()
@@ -882,22 +980,100 @@ class AgxArmRosNode(Node):
         self.get_logger().info(response.message)
         return response
 
+    def _drag_mode_callback(self, request, response):
+        """힘 빼고 사람이 끄는 대로 끌리는 모드(leader zero-force drag) ON/OFF.
+
+        ON  : set_leader_mode()로 진입. 팔은 중력보상되어 손으로 끌 수 있다.
+        OFF : 정상 제어 모드로 복귀하고, 사람이 놓아둔 현재 자세를 move_j로 hold한다.
+        """
+        try:
+            # drag(leader) 모드에서는 일반 joint feedback push가 꺼져 _check_arm_ready()가
+            # False가 되므로, 연결성은 is_ok()(leader 프레임 포함 수신 여부)로 확인한다.
+            # 이렇게 해야 drag 모드에서 OFF로 다시 빠져나올 수 있다.
+            if not self.agx_arm.is_ok():
+                response.success = False
+                response.message = "Agx_arm is not connected"
+                self.get_logger().warn("Agx_arm is not connected, cannot change drag mode")
+                return response
+            if not self.enable_flag:
+                response.success = False
+                response.message = "Agx_arm is not enabled, enable it before drag mode"
+                self.get_logger().warn(response.message)
+                return response
+
+            if request.data:
+                self.agx_arm.set_leader_mode()
+                self.drag_mode_active = True
+                self.is_mit_mode = False
+                response.success = True
+                response.message = "Drag mode enabled (arm is free to be hand-guided)"
+                self.get_logger().info(response.message)
+            else:
+                # 끌린 자세 먼저 읽기(leader 모드에선 leader 프레임이 유효)
+                pose = None
+                lja = self.agx_arm.get_leader_joint_angles()
+                if lja is not None:
+                    pose = list(lja.msg)
+
+                self._set_normal_control_mode()
+                self.drag_mode_active = False
+                self._drag_mode_block_logged = False
+
+                # leader 각도를 못 읽었으면 push 재개를 기다렸다가 일반 피드백으로 폴백
+                if pose is None:
+                    time.sleep(0.2)
+                    js = self.agx_arm.get_joint_angles()
+                    if js is not None and js.hz > 0:
+                        pose = list(js.msg)
+
+                if pose is not None:
+                    self.agx_arm.move_j(pose)
+                    self.is_mit_mode = False
+                else:
+                    self.get_logger().warn("Drag mode off: no valid joint angles to hold")
+
+                response.success = True
+                response.message = "Drag mode disabled (normal control restored)"
+                self.get_logger().info(response.message)
+        except Exception as e:
+            response.success = False
+            response.message = f"Exception occurred: {str(e)}"
+            self.get_logger().error(f"Failed to change drag mode: {str(e)}")
+        return response
+
     def _emergency_stop_callback(self, request, response):
         """Emergency stop: use is_switch_seamlessly flag to decide MIT vs move_j."""
         try:
-            if not self._check_arm_ready():
+            # drag 모드에선 push가 꺼져 _check_arm_ready()가 False가 될 수 있으므로
+            # 연결성은 is_ok()로 확인한다.
+            if not self.agx_arm.is_ok():
                 self.get_logger().warn("Agx_arm is not connected, cannot perform emergency stop")
                 return response
             if not self.enable_flag:
                 self.get_logger().warn("Agx_arm is not enabled, cannot perform emergency stop")
                 return response
 
+            # 드래그 모드 중이면 먼저 정상 제어 모드로 복귀해야 move_j가 적용됨
+            drag_pose = None
+            if self.drag_mode_active:
+                lja = self.agx_arm.get_leader_joint_angles()
+                if lja is not None:
+                    drag_pose = list(lja.msg)
+                self._set_normal_control_mode()
+                self.drag_mode_active = False
+                self._drag_mode_block_logged = False
+                if drag_pose is None:
+                    time.sleep(0.2)  # push 재개 대기 후 일반 피드백으로 폴백
+
             js = self.agx_arm.get_joint_angles()
-            if js is None or js.hz <= 0:
+            if js is not None and js.hz > 0:
+                q = list(js.msg)
+            elif drag_pose is not None:
+                q = drag_pose
+            else:
                 self.get_logger().warn("No valid joint angles, cannot perform emergency stop")
                 return response
 
-            q = list(js.msg)
             if not self.is_switch_seamlessly:
                 self.agx_arm.move_js(q)
                 self.is_mit_mode = True

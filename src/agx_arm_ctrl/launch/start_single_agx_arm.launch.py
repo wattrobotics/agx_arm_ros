@@ -98,6 +98,13 @@ def generate_launch_description():
         choices=['true', 'false'],
         description='Whether to accept /control/* commands.',
     )
+    enforce_joint_limits_on_start_arg = DeclareLaunchArgument(
+        'enforce_joint_limits_on_start',
+        default_value='false',
+        choices=['true', 'false'],
+        description='On startup, read the current joint state and move any out-of-limit '
+                    'joint back inside its joint limit.',
+    )
 
     # node
     agx_arm_node = Node(
@@ -120,6 +127,7 @@ def generate_launch_description():
             'gripper_default_effort': LaunchConfiguration('gripper_default_effort'),
             'publish_gripper_joint': LaunchConfiguration('publish_gripper_joint'),
             'control_enabled': LaunchConfiguration('control_enabled'),
+            'enforce_joint_limits_on_start': LaunchConfiguration('enforce_joint_limits_on_start'),
         }],
         remappings=[
             # feedback topics
@@ -144,6 +152,7 @@ def generate_launch_description():
             # services
             ('enable_agx_arm', 'enable_agx_arm'),
             ('control_enable', 'control_enable'),
+            ('drag_mode', 'drag_mode'),
             ('move_home', 'move_home'),
             ('emergency_stop', 'emergency_stop'),
             ('exit_teach_mode', 'exit_teach_mode'),
@@ -166,6 +175,7 @@ def generate_launch_description():
         gripper_default_effort_arg,
         publish_gripper_joint_arg,
         control_enabled_arg,
+        enforce_joint_limits_on_start_arg,
         # node
         agx_arm_node,
     ])
