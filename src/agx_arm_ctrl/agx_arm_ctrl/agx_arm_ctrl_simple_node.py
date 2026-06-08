@@ -36,6 +36,7 @@ class AgxArmSimpleNode(Node):
         self.declare_parameter("pub_rate", 100)
         self.declare_parameter("enable_timeout", 5.0)
         self.declare_parameter("control_enabled", True)
+        self.declare_parameter("debug", False)
         self.declare_parameter(
             "urdf_path",
             "/home/yunbeom/agx_arm_ws/src/agx_arm_ros/src/agx_arm_description/agx_arm_urdf/nero/nero_handeye.urdf",
@@ -65,6 +66,7 @@ class AgxArmSimpleNode(Node):
         self.pub_rate = self.get_parameter("pub_rate").value
         self.enable_timeout = self.get_parameter("enable_timeout").value
         self.control_enabled = self.get_parameter("control_enabled").value
+        self.debug = self.get_parameter("debug").value
         self.urdf_path = self.get_parameter("urdf_path").value
         self.gravity_scale = [self.get_parameter(f"gravity_scale_{j}").value for j in range(1, 8)]
         self.gravity_kd = [self.get_parameter(f"gravity_kd_{j}").value for j in range(1, 8)]
@@ -73,6 +75,7 @@ class AgxArmSimpleNode(Node):
         self.control_ready = False
         self.drag_mode_active = False
         self._was_drag = False
+        self._last_sleep_ms = 0.0
 
         self._init_arm()
         self._init_dynamics()
@@ -167,13 +170,16 @@ class AgxArmSimpleNode(Node):
                 self._publish_once()
             except Exception as e:
                 self.get_logger().warn(f"publish error: {e}")
+            s0 = time.perf_counter()
             time.sleep(max(0.0, 1.0 / self.pub_rate))  # pub_rate 런타임 변경 반영
+            self._last_sleep_ms = 1e3 * (time.perf_counter() - s0)
             if self.drag_mode_active:
                 # drag 중 실제 달성 루프율(= move_mit 송신율) 1초마다 측정
                 n += 1
                 now = time.time()
                 if now - t0 >= 1.0:
-                    self.get_logger().info(f"drag loop rate: {n / (now - t0):.0f} Hz")
+                    if self.debug:
+                        self.get_logger().info(f"drag loop rate: {n / (now - t0):.0f} Hz")
                     n, t0 = 0, now
             else:
                 n, t0 = 0, time.time()
@@ -185,10 +191,13 @@ class AgxArmSimpleNode(Node):
             self.control_ready = True
             self.get_logger().info("Agx_arm feedback is ready, control enabled")
 
+        clk = time.perf_counter
+        t0 = clk()
         js = self.agx_arm.get_joint_angles()
         if js is None or js.hz <= 0:
             return
         q = list(js.msg)
+        t_js = clk()
 
         # velocity/effort는 관절별 motor_states에서 (single_node와 동일).
         # 읽기 실패 시 0.0으로 채워 발행/아래 drag 루프가 끊기지 않게 한다.
@@ -197,6 +206,7 @@ class AgxArmSimpleNode(Node):
             ms = self.agx_arm.get_motor_states(j)
             velocities.append(ms.msg.velocity if ms is not None else 0.0)
             efforts.append(ms.msg.torque if ms is not None else 0.0)
+        t_ms = clk()
 
         msg = JointState()
         msg.header.stamp = self._to_ros_time(js.timestamp)
@@ -205,6 +215,8 @@ class AgxArmSimpleNode(Node):
         msg.velocity = velocities
         msg.effort = efforts
         self.joint_states_pub.publish(msg)
+        t_pub = clk()
+        t_grav = t_mit = t_pub  # drag 아닐 때 grav/move_mit 구간은 0
 
         # 중력보상 drag: 모든 CAN 모션 명령은 이 스레드에서만 나간다(레이스 방지)
         if self.drag_mode_active and self._gc_ok:
@@ -212,21 +224,36 @@ class AgxArmSimpleNode(Node):
                 self.pin_model, self.pin_data, np.asarray(q, dtype=float)
             )
             tff = [float(self.gravity_scale[i] * tau[i]) for i in range(self.arm_joint_count)]
+            t_grav = clk()
             for i in range(self.arm_joint_count):
                 self.agx_arm.move_mit(
                     joint_index=i + 1, p_des=0.0, v_des=0.0,
                     kp=0.0, kd=self.gravity_kd[i],
                     t_ff=tff[i],
                 )
-            self.get_logger().info(
-                "t_ff=[" + ", ".join(f"{t:+.2f}" for t in tff) + "] N.m",
-                throttle_duration_sec=0.5,
-            )
+            t_mit = clk()
+            if self.debug:
+                self.get_logger().info(
+                    "t_ff=[" + ", ".join(f"{v:+.2f}" for v in tff) + "] N.m",
+                    throttle_duration_sec=0.5,
+                )
             self._was_drag = True
         elif self._was_drag:
             # drag 해제 falling edge: 현재 자세를 move_j로 hold
             self.agx_arm.move_j(q)
             self._was_drag = False
+
+        if self.debug:
+            work = 1e3 * (t_mit - t0)
+            slp = self._last_sleep_ms  # 직전 사이클 sleep (pub_rate 고정이면 ≈ 현 사이클)
+            self.get_logger().info(
+                "[loop ms] "
+                f"get_q={1e3 * (t_js - t0):.2f}  motor_states={1e3 * (t_ms - t_js):.2f}  "
+                f"pub={1e3 * (t_pub - t_ms):.2f}  grav={1e3 * (t_grav - t_pub):.2f}  "
+                f"move_mit={1e3 * (t_mit - t_grav):.2f}  work={work:.2f}  "
+                f"sleep={slp:.2f}  cycle={work + slp:.2f}",
+                throttle_duration_sec=0.5,
+            )
 
     def _control_cb(self, msg: JointState):
         if not self._can_control():
@@ -328,6 +355,8 @@ class AgxArmSimpleNode(Node):
                     self.gravity_kd[idx] = max(0.0, min(5.0, float(p.value)))
             elif p.name == "pub_rate":
                 self.pub_rate = max(10, int(p.value))
+            elif p.name == "debug":
+                self.debug = bool(p.value)
         self.get_logger().info(
             "scale=[" + ",".join(f"{s:.2f}" for s in self.gravity_scale) + "] "
             "kd=[" + ",".join(f"{k:.2f}" for k in self.gravity_kd) + "] "
