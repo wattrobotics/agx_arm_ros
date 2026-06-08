@@ -3,13 +3,15 @@
 import time
 import rclpy
 import math
+import statistics
 import threading
 from typing import Optional
 from pyAgxArm import create_agx_arm_config, AgxArmFactory, ArmModel, PiperFW, NeroFW
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from builtin_interfaces.msg import Time
-from std_srvs.srv import SetBool, Empty
+from std_srvs.srv import SetBool, Empty, Trigger
+from action_msgs.srv import CancelGoal
 from geometry_msgs.msg import Pose, PoseStamped, PoseArray
 from scipy.spatial.transform import Rotation as R
 
@@ -83,6 +85,13 @@ class AgxArmRosNode(Node):
         self.publisher_thread = threading.Thread(target=self._publish_thread)
         self.publisher_thread.start()
 
+        ### collision guard: FJT cancel client + watchdog thread
+        self._fjt_cancel_cli = self.create_client(
+            CancelGoal, f"{self.arm_controller_action}/_action/cancel_goal"
+        )
+        self.collision_thread = threading.Thread(target=self._collision_watchdog, daemon=True)
+        self.collision_thread.start()
+
     ### initialization methods
     def _declare_parameters(self):
         self.declare_parameter("can_port", "can0")
@@ -98,6 +107,13 @@ class AgxArmRosNode(Node):
         self.declare_parameter("publish_gripper_joint", True)
         self.declare_parameter("control_enabled", True)
         self.declare_parameter("enforce_joint_limits_on_start", True)
+        # 충돌 자동 leader 전환 가드
+        self.declare_parameter("collision_guard_enabled", False)
+        # 관절별 crash protection rating 배열(길이=관절수). 각 0~8(0=해당 관절 끔), 전부 0=전체 끔.
+        self.declare_parameter("crash_protection_level", [0, 0, 0, 0, 0, 0, 0])
+        self.declare_parameter("collision_window_sec", 3.0)      # 정지 판정 윈도우
+        self.declare_parameter("collision_std_deg", 2.0)         # 정지 판정 joint 표준편차 임계(도)
+        self.declare_parameter("arm_controller_action", "arm_controller/follow_joint_trajectory")
 
     def _load_parameters(self):
         self.can_port = self.get_parameter("can_port").value
@@ -113,6 +129,11 @@ class AgxArmRosNode(Node):
         self.publish_gripper_joint = self.get_parameter("publish_gripper_joint").value
         self.control_enabled = self.get_parameter("control_enabled").value
         self.enforce_joint_limits_on_start = self.get_parameter("enforce_joint_limits_on_start").value
+        self.collision_guard_enabled = self.get_parameter("collision_guard_enabled").value
+        self.crash_protection_level = self.get_parameter("crash_protection_level").value
+        self.collision_window_sec = self.get_parameter("collision_window_sec").value
+        self.collision_std_deg = self.get_parameter("collision_std_deg").value
+        self.arm_controller_action = self.get_parameter("arm_controller_action").value
 
         if self.arm_type not in ArmModel.__dict__.values():
             self.get_logger().error(
@@ -142,6 +163,10 @@ class AgxArmRosNode(Node):
         self.drag_mode_active = False         # 끌리는 모드(leader zero-force drag) 활성 여부
         self._drag_exit_use_follower = False  # 해제 시 follower 모드 사용(nero >= 1.12)
         self._drag_mode_block_logged = False  # 드래그 중 제어 차단 로그 1회용
+        # 충돌 자동 leader 전환 가드 상태
+        self.collision_guard_on = self.collision_guard_enabled  # 가드 on/off (collision_guard 서비스로 토글)
+        self.collision_active = False         # 충돌→leader 전환 중(이 동안 control/* 차단)
+        self._collision_block_logged = False  # 충돌 중 제어 차단 로그 1회용
 
     def _log_parameters(self):
         self.get_logger().info(f"can_port: {self.can_port}")
@@ -157,6 +182,10 @@ class AgxArmRosNode(Node):
         self.get_logger().info(f"publish_gripper_joint: {self.publish_gripper_joint}")
         self.get_logger().info(f"control_enabled: {self.control_enabled}")
         self.get_logger().info(f"enforce_joint_limits_on_start: {self.enforce_joint_limits_on_start}")
+        self.get_logger().info(f"collision_guard_enabled: {self.collision_guard_enabled}")
+        self.get_logger().info(f"crash_protection_level: {self.crash_protection_level}")
+        self.get_logger().info(f"collision_window_sec: {self.collision_window_sec}")
+        self.get_logger().info(f"collision_std_deg: {self.collision_std_deg}")
 
     def _init_agx_arm(self):
         config: PiperCanDefaultConfig = create_agx_arm_config(
@@ -169,20 +198,16 @@ class AgxArmRosNode(Node):
         self.arm_joint_limits = list(config["joint_limits"].values())  # 관절 순서의 [[min, max], ...]
         self.arm_joint_count = self.agx_arm.joint_nums
 
-        if self.auto_enable:
-            if not self._enable_arm(True, self.enable_timeout):
-                self.get_logger().error("Failed to auto-enable the arm")
-        else:
-            time.sleep(0.1)
-            self.enable_flag = self.agx_arm.get_joint_enable_status(255)
-
+        # 펌웨어 버전 확정 + 필요 시 해당 드라이버로 재연결을 enable 전에 수행한다.
+        # (crash protection 레벨은 disable 상태 + 드라이버 확정 후에만 변경 가능 — 실측)
         start_time = time.time()
+        self.firmware = None
         while time.time() - start_time < self.enable_timeout:
             self.firmware = self.agx_arm.get_firmware()
             if self.firmware:
                 break
             time.sleep(0.005)
-        
+
         if self.firmware:
             current_version = self.firmware['software_version']
             self.get_logger().info(f"firmware version: {current_version}")
@@ -214,6 +239,45 @@ class AgxArmRosNode(Node):
         else:
             self.get_logger().error("Failed to get firmware version")
             exit(1)
+
+        # crash protection 레벨 — 관절별 정수 배열(길이=관절수, joint_index 1~7에 1:1). 각 0~8(0=해당 관절 끔).
+        # 전부 0(또는 빈 배열)이면 전체 끔으로 보고 disable/set 생략(limp 없음).
+        # 드라이버 확정 후 + 모터 disable 상태에서만 변경 가능(실측). enable 상태에선 펌웨어가
+        # 레벨 변경을 거부하므로(-> False), set 전에 명시적으로 disable한다. (disconnect/connect는 CAN
+        # 소켓 재오픈일 뿐 모터 파워사이클이 아니라, 핫 리런치 시 팔이 직전 enable 상태를 유지 →
+        # set이 거부됨. 따라서 여기서 강제로 disable→set(관절별)→enable.)
+        levels = [int(v) for v in (self.crash_protection_level or [])]
+        if any(v > 0 for v in levels):
+            if len(levels) != self.arm_joint_count:
+                self.get_logger().error(
+                    f"crash_protection_level length {len(levels)} != joint count "
+                    f"{self.arm_joint_count}; skipping crash protection setup"
+                )
+            else:
+                try:
+                    self._enable_arm(False, self.enable_timeout)   # disable (retry+verify)
+                    time.sleep(0.6)                                 # 레벨 변경 수락 대기(실측 타이밍)
+                    results = []
+                    for i, rating in enumerate(levels):
+                        ok = self.agx_arm.set_crash_protection_rating(
+                            joint_index=i + 1, rating=rating        # joint_index는 1-indexed
+                        )
+                        results.append(ok)
+                        time.sleep(0.05)                            # CAN 과도송신 방지
+                    self.get_logger().info(
+                        f"set_crash_protection_rating per-joint {levels} -> {results}"
+                    )
+                    time.sleep(0.3)
+                except Exception as e:
+                    self.get_logger().warn(f"set_crash_protection_rating failed: {e}")
+
+        # enable (crash 설정 이후)
+        if self.auto_enable:
+            if not self._enable_arm(True, self.enable_timeout):
+                self.get_logger().error("Failed to auto-enable the arm")
+        else:
+            time.sleep(0.1)
+            self.enable_flag = self.agx_arm.get_joint_enable_status(255)
 
         self.agx_arm.set_speed_percent(self.speed_percent)
         self.agx_arm.set_tcp_offset(self.tcp_offset)
@@ -297,6 +361,8 @@ class AgxArmRosNode(Node):
         self.create_service(SetBool, "enable_agx_arm", self._enable_callback)
         self.create_service(SetBool, "control_enable", self._control_gate_callback)
         self.create_service(SetBool, "drag_mode", self._drag_mode_callback)
+        self.create_service(SetBool, "collision_guard", self._collision_guard_callback)
+        self.create_service(Trigger, "get_crash_protection_rating", self._get_crash_rating_callback)
         self.create_service(Empty, "move_home", self._move_home_callback)
         self.create_service(Empty, "emergency_stop", self._emergency_stop_callback)
         if not self.is_switch_seamlessly:
@@ -326,6 +392,12 @@ class AgxArmRosNode(Node):
         if not self.control_ready:
             # Startup warm-up: ignore incoming control commands until a valid
             # joint state stream is available.
+            return False
+        if self.collision_active:
+            # 충돌 감지 후 leader 전환/복구 중에는 외부 제어 명령을 무시한다.
+            if not self._collision_block_logged:
+                self.get_logger().info("Collision guard active (leader), ignore control commands")
+                self._collision_block_logged = True
             return False
         if self.drag_mode_active:
             # 사람이 손으로 끄는 동안에는 제어 명령을 무시한다.
@@ -1040,6 +1112,158 @@ class AgxArmRosNode(Node):
             response.message = f"Exception occurred: {str(e)}"
             self.get_logger().error(f"Failed to change drag mode: {str(e)}")
         return response
+
+    ### collision guard (충돌 시 leader 전환 → 정지 시 normal 복귀)
+    def _collision_guard_callback(self, request, response):
+        """충돌 자동 leader 전환 가드 ON/OFF."""
+        self.collision_guard_on = bool(request.data)
+        if not self.collision_guard_on:
+            self._collision_block_logged = False
+        response.success = True
+        response.message = f"Collision guard {'on' if self.collision_guard_on else 'off'}"
+        self.get_logger().info(response.message)
+        return response
+
+    def _get_crash_rating_callback(self, request, response):
+        """현재 crash protection rating(관절별 0~8)을 조회해 message로 반환한다.
+        (leader/충돌 중에는 push가 꺼져 일시적으로 None일 수 있음 — normal 상태에서 조회 권장)
+        """
+        try:
+            r = self.agx_arm.get_crash_protection_rating()
+            if r is None:
+                response.success = False
+                response.message = "crash protection rating unavailable (None)"
+            else:
+                response.success = True
+                response.message = str(list(r.msg))
+            self.get_logger().info(f"crash protection rating: {response.message}")
+        except Exception as e:
+            response.success = False
+            response.message = f"Exception: {e}"
+            self.get_logger().warn(f"get_crash_protection_rating failed: {e}")
+        return response
+
+    def _cancel_trajectory(self) -> None:
+        """진행 중인 FollowJointTrajectory goal(들)을 취소한다.
+
+        빈 goal_info(goal_id all-zero, stamp 0) = 모든 active goal 취소. RViz/MoveIt이 보낸
+        goal이라도 action server(JTC)에 cancel 요청으로 취소할 수 있어, 충돌로 중단된 긴
+        궤적의 잔여 waypoint가 더 이상 흘러오지 않는다.
+        """
+        try:
+            if not self._fjt_cancel_cli.service_is_ready():
+                self.get_logger().warn("FJT cancel service not available, skip trajectory cancel")
+                return
+            self._fjt_cancel_cli.call_async(CancelGoal.Request())
+        except Exception as e:
+            self.get_logger().warn(f"FJT cancel failed: {e}")
+
+    def _enter_leader_mode(self) -> None:
+        """충돌 trip 상태에서 leader(zero-force) 진입을 verify + retry(성공까지).
+
+        clear_joint_error → (CAN 침묵 sleep) → set_leader_mode → leader 프레임(hz>0) 확인.
+        COLLISION 상태에선 set_leader_mode가 거부되므로 clear로 먼저 해소하고, clear 직후
+        CAN을 잠깐 쉰 뒤 전환해야 leader가 걸린다(벤치 실측).
+        """
+        t_start = time.time()
+        k = 0
+        while rclpy.ok() and self.collision_active:
+            k += 1
+            self.agx_arm.clear_joint_error(255)
+            time.sleep(0.3)  # clear 반영 + CAN 침묵 (없으면 set_leader_mode가 묻혀 안 걸림)
+            st = self.agx_arm.get_arm_status()
+            if st is not None and int(st.msg.arm_status) == 0x07:  # COLLISION_OCCURRED 잔류
+                continue
+            self.agx_arm.set_leader_mode()
+            time.sleep(0.3)  # leader 전환 + 첫 프레임 대기
+            lja = self.agx_arm.get_leader_joint_angles()
+            if lja is not None and lja.hz > 0:
+                self.get_logger().info(
+                    f"Collision: leader entered (hz={lja.hz:.0f}, {k} tries, {time.time()-t_start:.1f}s)"
+                )
+                return
+            self.get_logger().warn(f"Collision: leader not entered (try {k}), retry...")
+
+    def _collision_watchdog(self) -> None:
+        """충돌 가드 watchdog(별도 스레드).
+
+        IDLE: foc collision bit 감지 → FJT 취소 + leader 전환.
+        DRAG: leader 자세가 collision_window_sec 동안 모든 joint 표준편차 < collision_std_deg(도)
+              로 정지하면 → normal 복귀 + 실제 자세 hold → control 자동 재개.
+        """
+        std_thresh = math.radians(self.collision_std_deg)
+        window = self.collision_window_sec
+        hist = []          # [(t, [q...]), ...] leader 자세 이력(window 슬라이딩)
+        period = 1.0 / 30.0
+        while rclpy.ok():
+            time.sleep(period)
+            if not self.collision_guard_on:
+                continue
+            try:
+                if not self.collision_active:
+                    # IDLE: 충돌 감지 (foc collision bit)
+                    if not (self.control_ready and self.enable_flag and self.agx_arm.is_ok()):
+                        continue
+                    if self.drag_mode_active:
+                        continue
+                    tripped_joints = []
+                    coll_bits = []
+                    for j in range(1, self.arm_joint_count + 1):
+                        ds = self.agx_arm.get_driver_states(j)
+                        b = 1 if (ds is not None and getattr(ds.msg.foc_status, "collision_status", False)) else 0
+                        coll_bits.append(b)
+                        if b:
+                            tripped_joints.append(j)
+                    if tripped_joints:
+                        # 충돌 순간: 어느 관절(들)에서 trip 됐는지 + 모든 관절 토크(전류 환산)를 함께 기록
+                        torques = []
+                        for j in range(1, self.arm_joint_count + 1):
+                            ms = self.agx_arm.get_motor_states(j)
+                            torques.append(round(ms.msg.torque, 2) if ms is not None else float("nan"))
+                        self.get_logger().warn(
+                            f"Collision detected: joint(s)={tripped_joints}  "
+                            f"coll_bits={coll_bits}  torque(N.m)={torques} "
+                            "-> cancel trajectory + enter leader"
+                        )
+                        self.collision_active = True   # 먼저 control/* 차단
+                        self._cancel_trajectory()      # 진행 중 MoveIt 궤적 폐기(잔여 차단)
+                        self._enter_leader_mode()      # leader 전환(verify+retry)
+                        hist = []
+                else:
+                    # DRAG: leader 정지 판정 → normal 복귀
+                    lja = self.agx_arm.get_leader_joint_angles()
+                    now = time.time()
+                    if lja is not None:
+                        q = list(lja.msg)
+                        hist.append((now, q))
+                        hist = [(t, qq) for (t, qq) in hist if now - t <= window]
+                        if len(hist) >= 5 and (now - hist[0][0]) >= window * 0.95:
+                            stds = [
+                                statistics.pstdev([qq[i] for (_, qq) in hist])
+                                for i in range(self.arm_joint_count)
+                            ]
+                            if all(s < std_thresh for s in stds):
+                                self.get_logger().info(
+                                    f"Collision: arm settled (window {window:.0f}s, all joint "
+                                    f"sigma < {self.collision_std_deg:.1f} deg) -> normal recover"
+                                )
+                                self._set_normal_control_mode()
+                                # 복귀 후 실제 현재 자세로 hold (leader q와 미세 차이로 튀지 않도록)
+                                t_n = time.time()
+                                q0 = list(q)
+                                while time.time() - t_n < 0.5:
+                                    cq = self.agx_arm.get_joint_angles()
+                                    if cq is not None and cq.hz > 0:
+                                        q0 = list(cq.msg)
+                                        break
+                                    time.sleep(0.02)
+                                self.agx_arm.move_j(q0)
+                                self.is_mit_mode = False
+                                self.collision_active = False
+                                self._collision_block_logged = False
+                                hist = []
+            except Exception as e:
+                self.get_logger().warn(f"collision watchdog error: {e}")
 
     def _emergency_stop_callback(self, request, response):
         """Emergency stop: use is_switch_seamlessly flag to decide MIT vs move_j."""

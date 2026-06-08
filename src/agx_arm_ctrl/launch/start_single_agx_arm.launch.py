@@ -105,6 +105,29 @@ def generate_launch_description():
         description='On startup, read the current joint state and move any out-of-limit '
                     'joint back inside its joint limit.',
     )
+    collision_guard_enabled_arg = DeclareLaunchArgument(
+        'collision_guard_enabled',
+        default_value='true',
+        choices=['true', 'false'],
+        description='On collision (foc bit), auto switch to leader mode and recover on settle.',
+    )
+    crash_protection_level_arg = DeclareLaunchArgument(
+        'crash_protection_level',
+        default_value='[7, 7, 7, 7, 7, 7, 7]',
+        description='Per-joint crash protection rating array (length=joint count, joint_index 1..7). '
+                    'Each 0~8 (0=that joint off); all-zeros=off. Set at startup in disable state. '
+                    'Required for collision_guard.',
+    )
+    collision_window_sec_arg = DeclareLaunchArgument(
+        'collision_window_sec',
+        default_value='3.0',
+        description='collision_guard: settle-judgement window (s).',
+    )
+    collision_std_deg_arg = DeclareLaunchArgument(
+        'collision_std_deg',
+        default_value='2.0',
+        description='collision_guard: settle-judgement joint stddev threshold (deg).',
+    )
 
     # node
     agx_arm_node = Node(
@@ -128,6 +151,10 @@ def generate_launch_description():
             'publish_gripper_joint': LaunchConfiguration('publish_gripper_joint'),
             'control_enabled': LaunchConfiguration('control_enabled'),
             'enforce_joint_limits_on_start': LaunchConfiguration('enforce_joint_limits_on_start'),
+            'collision_guard_enabled': LaunchConfiguration('collision_guard_enabled'),
+            'crash_protection_level': LaunchConfiguration('crash_protection_level'),
+            'collision_window_sec': LaunchConfiguration('collision_window_sec'),
+            'collision_std_deg': LaunchConfiguration('collision_std_deg'),
         }],
         remappings=[
             # feedback topics
@@ -153,6 +180,8 @@ def generate_launch_description():
             ('enable_agx_arm', 'enable_agx_arm'),
             ('control_enable', 'control_enable'),
             ('drag_mode', 'drag_mode'),
+            ('collision_guard', 'collision_guard'),
+            ('get_crash_protection_rating', 'get_crash_protection_rating'),
             ('move_home', 'move_home'),
             ('emergency_stop', 'emergency_stop'),
             ('exit_teach_mode', 'exit_teach_mode'),
@@ -176,6 +205,10 @@ def generate_launch_description():
         publish_gripper_joint_arg,
         control_enabled_arg,
         enforce_joint_limits_on_start_arg,
+        collision_guard_enabled_arg,
+        crash_protection_level_arg,
+        collision_window_sec_arg,
+        collision_std_deg_arg,
         # node
         agx_arm_node,
     ])

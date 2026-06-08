@@ -127,6 +127,24 @@ def generate_launch_description():
         description='SetBool gate service for agx_arm_control_gate when auto_control_gate:=true.',
     )
 
+    collision_guard_enabled_arg = DeclareLaunchArgument(
+        'collision_guard_enabled', default_value='true', choices=['true', 'false'],
+        description='On collision (foc bit), auto switch to leader mode and recover on settle.',
+    )
+    crash_protection_level_arg = DeclareLaunchArgument(
+        'crash_protection_level', default_value='[8, 8, 8, 8, 8, 8, 8]',
+        description='Per-joint crash protection rating array (length=joint count, joint_index 1..7). '
+                    'Each 0~8 (0=that joint off); all-zeros=off. Required for collision_guard.',
+    )
+    collision_window_sec_arg = DeclareLaunchArgument(
+        'collision_window_sec', default_value='3.0',
+        description='collision_guard: settle-judgement window (s).',
+    )
+    collision_std_deg_arg = DeclareLaunchArgument(
+        'collision_std_deg', default_value='2.0',
+        description='collision_guard: settle-judgement joint stddev threshold (deg).',
+    )
+
     # ── agx_arm_ctrl ─────────────────────────────────────────────────
     agx_arm_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -155,6 +173,10 @@ def generate_launch_description():
                 if_value='false',
                 else_value='true',
             ),
+            'collision_guard_enabled': LaunchConfiguration('collision_guard_enabled'),
+            'crash_protection_level': LaunchConfiguration('crash_protection_level'),
+            'collision_window_sec': LaunchConfiguration('collision_window_sec'),
+            'collision_std_deg': LaunchConfiguration('collision_std_deg'),
         }.items(),
     )
 
@@ -201,6 +223,10 @@ def generate_launch_description():
         control_topic_arg,
         auto_control_gate_arg,
         control_gate_service_arg,
+        collision_guard_enabled_arg,
+        crash_protection_level_arg,
+        collision_window_sec_arg,
+        collision_std_deg_arg,
         # launches
         agx_arm_launch,
         moveit_launch,
