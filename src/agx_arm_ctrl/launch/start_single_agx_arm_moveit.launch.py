@@ -85,6 +85,7 @@ def generate_launch_description():
     tcp_offset_arg = DeclareLaunchArgument(
         'tcp_offset',
         default_value='[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]',
+        # default_value='[0.0167, -0.016, -0.024, -0.785, 1.571, 2.356]',
         description='TCP offset in x, y, z, roll, pitch, yaw in meters/radians.'
     )
 
