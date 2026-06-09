@@ -11,6 +11,7 @@ import rclpy
 import numpy as np
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
+from std_msgs.msg import Int32
 from builtin_interfaces.msg import Time
 from std_srvs.srv import SetBool, Trigger
 from action_msgs.srv import CancelGoal
@@ -72,6 +73,21 @@ class AgxArmSimpleNode(Node):
                 floating_point_range=[FloatingPointRange(from_value=0.0, to_value=24.0, step=0.0)],
             ),
         )
+        # 가드 trip drag 자동복귀: 자세가 window초 동안 정지하면 drag 해제
+        self.declare_parameter(
+            "deviation_recover_window_sec", 2.0,
+            ParameterDescriptor(
+                description="가드 drag 중 자세 정지가 이만큼 지속되면 자동 복귀(s)",
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=30.0, step=0.0)],
+            ),
+        )
+        self.declare_parameter(
+            "deviation_recover_still_deg", 2.0,
+            ParameterDescriptor(
+                description="정지 판정 관절별 표준편차 임계(도)",
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=20.0, step=0.0)],
+            ),
+        )
         self.declare_parameter(
             "urdf_path",
             "/home/yunbeom/agx_arm_ws/src/agx_arm_ros/src/agx_arm_description/agx_arm_urdf/nero/nero_handeye.urdf",
@@ -126,6 +142,8 @@ class AgxArmSimpleNode(Node):
         self.deviation_window_sec = self.get_parameter("deviation_window_sec").value
         self.deviation_cmd_timeout = self.get_parameter("deviation_cmd_timeout").value
         self.deviation_torque_threshold = self.get_parameter("deviation_torque_threshold").value
+        self.deviation_recover_window_sec = self.get_parameter("deviation_recover_window_sec").value
+        self.deviation_recover_still_deg = self.get_parameter("deviation_recover_still_deg").value
         self.urdf_path = self.get_parameter("urdf_path").value
         self.gravity_scale = [self.get_parameter(f"gravity_scale_{j}").value for j in range(1, 8)]
         self.gravity_kd = [self.get_parameter(f"gravity_kd_{j}").value for j in range(1, 8)]
@@ -142,6 +160,8 @@ class AgxArmSimpleNode(Node):
         self._last_cmd = None        # 최근 명령 관절(arm_joint_names 순서)
         self._last_cmd_t = 0.0       # 최근 명령 수신 시각 time.time()
         self._dev_trip_since = None  # 편차 초과가 처음 시작된 perf_counter 시각
+        self._drag_by_guard = False  # drag가 가드 트립으로 진입했는지(자동복귀 대상)
+        self._settle_hist = []       # [(t_perf, q), ...] 자동복귀용 정지판정 슬라이딩 윈도우
 
         self._init_arm()
         self._init_dynamics()
@@ -151,8 +171,12 @@ class AgxArmSimpleNode(Node):
             )
 
         self.joint_states_pub = self.create_publisher(JointState, "feedback/joint_states", 1)
-        # 현재 자세에서 필요한 중력 피드포워드 토크 G(q) (effort에 담음, drag 무관 상시 발행)
-        self.ff_torque_pub = self.create_publisher(JointState, "feedback/feedforward_torque", 1)
+        # move_mit 파라미터로 계산한 기대 토크 T_ref(effort에 담음, gc_ok 시 매 주기 발행)
+        self.expected_mit_torque_pub = self.create_publisher(
+            JointState, "feedback/expected_mit_torque", 1
+        )
+        # 디버깅용: drag 모드 여부(0=아님, 1=drag)
+        self.is_drag_mode_pub = self.create_publisher(Int32, "feedback/is_drag_mode", 1)
         self.create_subscription(JointState, "control/joint_states", self._control_cb, 1)
         self.create_service(SetBool, "enable_agx_arm", self._enable_cb)
         self.create_service(SetBool, "control_enable", self._gate_cb)
@@ -299,20 +323,19 @@ class AgxArmSimpleNode(Node):
         self.joint_states_pub.publish(msg)
         t_pub = clk()
 
-        # 중력토크 G(q): drag 여부와 무관하게 매 주기 계산·발행
-        # (현재 자세에서 각 관절에 필요한 피드포워드 토크 → feedback/feedforward_torque.effort)
+        # 디버깅용: drag 모드 여부(0/1) 매 주기 발행
+        self.is_drag_mode_pub.publish(Int32(data=1 if self.drag_mode_active else 0))
+
+        # 중력토크 G(q): drag 여부와 무관하게 매 주기 계산(아래 move 분기/가드에서 사용)
         tau = None
         if self._gc_ok:
             tau = pin.computeGeneralizedGravity(
                 self.pin_model, self.pin_data, np.asarray(q, dtype=float)
             )
-            ff = JointState()
-            ff.header.stamp = msg.header.stamp
-            ff.name = list(self.arm_joint_names)
-            ff.effort = [float(v) for v in tau]
-            self.ff_torque_pub.publish(ff)
         t_grav = clk()
         t_mit = t_grav  # drag 아닐 때 move_mit 구간은 0
+        # move_mit 파라미터 기반 기대 토크 T_ref(= kp(p_des-q)+kd(v_des-v)+t_ff). move_j 모드 기본: 중력만
+        texp = [float(v) for v in tau] if tau is not None else None
 
         # 편차 가드: 측정 토크 vs 기대 피드포워드 토크 차이가 임계 초과로 지속되면 트립
         self._deviation_check(q, efforts, t_pub)
@@ -323,6 +346,8 @@ class AgxArmSimpleNode(Node):
         if self.drag_mode_active and tau is not None:
             # drag: 중력보상만 (kp=0, 낮은 gravity_kd)
             tff = [float(self.gravity_scale[i] * tau[i]) for i in range(n)]
+            # 기대 토크: kp=0 → T = kd·(0−v) + t_ff
+            texp = [float(self.gravity_kd[i] * (0.0 - velocities[i]) + tff[i]) for i in range(n)]
             for i in range(n):
                 self.agx_arm.move_mit(
                     joint_index=i + 1, p_des=0.0, v_des=0.0,
@@ -336,6 +361,9 @@ class AgxArmSimpleNode(Node):
                     throttle_duration_sec=0.5,
                 )
             self._was_drag = True
+            # 가드 트립으로 진입한 drag면 자세 정지 시 자동 복귀 판정
+            if self._drag_by_guard:
+                self._settle_recover_check(q, t_grav)
         else:
             if self._was_drag:
                 # drag 막 해제: 현재 자세로 목표 고정(옛 명령으로 스냅 방지)
@@ -349,7 +377,13 @@ class AgxArmSimpleNode(Node):
                     self._last_cmd = list(q)        # 첫 명령 전: 현재 자세 유지
                 target = self._last_cmd             # 원자적 스냅샷
                 m = min(n, len(target))
+                texp = [float(v) for v in tau]
                 for i in range(m):
+                    texp[i] = float(
+                        self.mit_kp[i] * (target[i] - q[i])
+                        + self.mit_kd[i] * (0.0 - velocities[i])
+                        + self.gravity_scale[i] * tau[i]
+                    )
                     self.agx_arm.move_mit(
                         joint_index=i + 1, p_des=float(target[i]), v_des=0.0,
                         kp=self.mit_kp[i], kd=self.mit_kd[i],
@@ -361,6 +395,14 @@ class AgxArmSimpleNode(Node):
                         "mit p_des=[" + ", ".join(f"{v:+.2f}" for v in target[:m]) + "]",
                         throttle_duration_sec=0.5,
                     )
+
+        # move_mit 파라미터 기반 기대 토크 발행 (gc_ok일 때만)
+        if texp is not None:
+            em = JointState()
+            em.header.stamp = msg.header.stamp
+            em.name = list(self.arm_joint_names)
+            em.effort = texp
+            self.expected_mit_torque_pub.publish(em)
 
         if self.debug:
             work = 1e3 * (t_mit - t0)
@@ -454,6 +496,8 @@ class AgxArmSimpleNode(Node):
         self._cancel_trajectory()                          # 안전 핵심: 명령 스트림 중단
         if self._gc_ok:
             self.drag_mode_active = True                   # 다음 루프부터 drag 분기가 중력보상 이어받음
+            self._drag_by_guard = True                     # 정지 시 자동복귀 대상
+            self._settle_hist = []
             self.get_logger().info("Deviation guard: entered gravity-comp drag")
         else:                                              # 중력모델 없으면 drag 무의미 → hold 후 가드 끔
             self.get_logger().error(
@@ -461,6 +505,28 @@ class AgxArmSimpleNode(Node):
             )
             self.agx_arm.move_j(list(q))
             self.deviation_guard_on = False
+
+    def _settle_recover_check(self, q, t_now):
+        """가드 trip drag 중 자세가 recover_window_sec 동안 모든 관절 표준편차 <
+        recover_still_deg(도)로 정지하면 drag 자동 해제 + 마지막 자세를 MIT 목표로."""
+        win = self.deviation_recover_window_sec
+        thr = math.radians(self.deviation_recover_still_deg)
+        self._settle_hist.append((t_now, list(q)))
+        self._settle_hist = [(t, qq) for (t, qq) in self._settle_hist if t_now - t <= win]
+        if len(self._settle_hist) < 5 or (t_now - self._settle_hist[0][0]) < win * 0.95:
+            return
+        n = self.arm_joint_count
+        stds = [float(np.std([qq[i] for _, qq in self._settle_hist])) for i in range(n)]
+        if all(s < thr for s in stds):
+            self.get_logger().info(
+                f"Deviation guard: arm settled ({win:.1f}s, all joint sigma < "
+                f"{self.deviation_recover_still_deg:.1f} deg) -> recover, hold current pose"
+            )
+            self.drag_mode_active = False
+            self._drag_by_guard = False
+            self._settle_hist = []
+            self._last_cmd = list(q)        # 마지막(정지) 자세를 MIT 목표로
+            # 다음 주기 else 분기의 _was_drag falling-edge가 MIT/move_j hold로 이어받음
 
     def _cancel_trajectory(self):
         """진행 중인 FollowJointTrajectory goal(들)을 취소한다.
@@ -516,6 +582,9 @@ class AgxArmSimpleNode(Node):
             self.get_logger().warn(response.message)
             return response
         self.drag_mode_active = bool(request.data)
+        # 수동 토글 drag는 자동복귀 대상이 아님(가드 trip 표시 해제 + 정지윈도우 초기화)
+        self._drag_by_guard = False
+        self._settle_hist = []
         response.success = True
         response.message = f"Drag(gravity-comp) {'on' if request.data else 'off'}"
         self.get_logger().info(response.message)
@@ -531,7 +600,8 @@ class AgxArmSimpleNode(Node):
             + "  kd=[" + ",".join(f"{k:.2f}" for k in self.gravity_kd) + "]",
             f"dev_guard={'on' if self.deviation_guard_on else 'off'}(torque)  "
             f"tau_thr={self.deviation_torque_threshold:.2f}N.m  win={self.deviation_window_sec:.2f}s  "
-            f"(pos_thr={self.deviation_threshold:.3f}rad disabled)",
+            f"recover={self.deviation_recover_window_sec:.1f}s/{self.deviation_recover_still_deg:.1f}deg"
+            + ("  [drag_by_guard]" if self._drag_by_guard else ""),
             f"ctrl_method={self.arm_control_mode}"
             + (f" (mit active  kp=[{','.join(f'{v:.0f}' for v in self.mit_kp)}]"
                f"  kd=[{','.join(f'{v:.2f}' for v in self.mit_kd)}])"
@@ -589,6 +659,10 @@ class AgxArmSimpleNode(Node):
                 self.deviation_cmd_timeout = max(0.0, float(p.value))
             elif p.name == "deviation_torque_threshold":
                 self.deviation_torque_threshold = max(0.0, float(p.value))
+            elif p.name == "deviation_recover_window_sec":
+                self.deviation_recover_window_sec = max(0.0, float(p.value))
+            elif p.name == "deviation_recover_still_deg":
+                self.deviation_recover_still_deg = max(0.0, float(p.value))
             elif p.name == "arm_control_mode":
                 self.arm_control_mode = str(p.value)
             elif p.name.startswith("mit_kp_"):
