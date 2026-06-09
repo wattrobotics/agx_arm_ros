@@ -26,6 +26,7 @@ import rclpy
 import numpy as np
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
+from geometry_msgs.msg import WrenchStamped
 from builtin_interfaces.msg import Time
 from std_srvs.srv import SetBool, Trigger
 from rcl_interfaces.msg import SetParametersResult, ParameterDescriptor, FloatingPointRange
@@ -90,6 +91,8 @@ class AgxArmSimpleTeleopNode(Node):
             "urdf_path",
             "/home/yunbeom/agx_arm_ws/src/agx_arm_ros/src/agx_arm_description/agx_arm_urdf/nero/nero_handeye.urdf",
         )
+        # endeffector_force 추정 대상 EE 프레임(런타임 변경 가능)
+        self.declare_parameter("ee_frame", "end_point_link")
         for j in range(1, 8):
             self.declare_parameter(
                 f"gravity_scale_{j}", 1.0,
@@ -115,6 +118,7 @@ class AgxArmSimpleTeleopNode(Node):
         self.linear_step = self.get_parameter("linear_step").value
         self.angular_step = self.get_parameter("angular_step").value
         self.urdf_path = self.get_parameter("urdf_path").value
+        self.ee_frame = self.get_parameter("ee_frame").value
         self.gravity_scale = [self.get_parameter(f"gravity_scale_{j}").value for j in range(1, 8)]
         self.gravity_kd = [self.get_parameter(f"gravity_kd_{j}").value for j in range(1, 8)]
 
@@ -127,6 +131,8 @@ class AgxArmSimpleTeleopNode(Node):
         self._init_dynamics()
 
         self.joint_states_pub = self.create_publisher(JointState, "feedback/joint_states", 1)
+        # 관성가중 토크-잔차 EE 힘 추정 (watt calculate_force와 동일 원리)
+        self.ee_force_pub = self.create_publisher(WrenchStamped, "feedback/endeffector_force", 1)
         self.create_service(Trigger, "get_robot_state", self._get_state_cb)
         self.create_service(SetBool, "drag_mode", self._drag_cb)
         self.add_on_set_parameters_callback(self._on_set_params)
@@ -161,6 +167,7 @@ class AgxArmSimpleTeleopNode(Node):
         simple_node에서 차용."""
         self._gc_ok = False
         self.pin_model = None
+        self.ee_frame_id = None
         if not _HAS_PIN:
             self.get_logger().warn("pinocchio not available; drag(gravity-comp) disabled")
             return
@@ -176,6 +183,7 @@ class AgxArmSimpleTeleopNode(Node):
                 )
             self._gc_ok = True
             self.get_logger().info(f"Gravity model loaded (nv={self.pin_model.nv})")
+            self._resolve_ee_frame(self.ee_frame)
         except Exception as e:
             self.get_logger().error(f"gravity model load failed: {e}")
 
@@ -245,12 +253,36 @@ class AgxArmSimpleTeleopNode(Node):
             return
         q = list(js.msg)
 
-        # feedback/joint_states (position only)
+        # 관절별 모터 상태(velocity/effort) — joint_states + force 추정 공용 (get_motor_states 1회)
+        velocities, efforts = [], []
+        for j in range(1, self.arm_joint_count + 1):
+            ms = self.agx_arm.get_motor_states(j)
+            velocities.append(ms.msg.velocity if ms is not None else 0.0)
+            efforts.append(ms.msg.torque if ms is not None else 0.0)
+
+        # feedback/joint_states (position + velocity + effort)
         msg = JointState()
         msg.header.stamp = self._to_ros_time(js.timestamp)
         msg.name = list(self.arm_joint_names)
         msg.position = q
+        msg.velocity = velocities
+        msg.effort = efforts
         self.joint_states_pub.publish(msg)
+
+        # endeffector_force: 관성가중 토크-잔차로 EE 힘 추정·발행 (drag/move_p 무관 매 주기)
+        if self._gc_ok and self.ee_frame_id is not None:
+            tau_g = pin.computeGeneralizedGravity(
+                self.pin_model, self.pin_data, np.asarray(q, dtype=float)
+            )
+            F = self._estimate_ee_force(q, efforts, tau_g)
+            if F is not None:
+                w = WrenchStamped()
+                w.header.stamp = msg.header.stamp
+                w.header.frame_id = self.ee_frame
+                w.wrench.force.x = float(F[0])
+                w.wrench.force.y = float(F[1])
+                w.wrench.force.z = float(F[2])
+                self.ee_force_pub.publish(w)
 
         # drag(중력보상) 모드: move_p 스트리밍 대신 move_mit 중력보상만
         if self.drag_mode_active and self._gc_ok:
@@ -284,6 +316,44 @@ class AgxArmSimpleTeleopNode(Node):
                 kp=0.0, kd=self.gravity_kd[i],
                 t_ff=float(self.gravity_scale[i] * tau[i]),
             )
+
+    ### endeffector force estimation
+    def _resolve_ee_frame(self, name):
+        """ee_frame 이름 → Pinocchio frame id 해석/검증. init·런타임 변경 공용."""
+        if not self._gc_ok:
+            self.ee_frame_id = None
+            return
+        if self.pin_model.existFrame(name):
+            self.ee_frame = name
+            self.ee_frame_id = self.pin_model.getFrameId(name)
+            self.get_logger().info(f"endeffector_force frame = '{name}'")
+        else:
+            self.ee_frame_id = None
+            self.get_logger().warn(f"ee_frame '{name}' not in model; endeffector_force disabled")
+
+    def _estimate_ee_force(self, q, efforts, tau):
+        """관성가중 토크-잔차로 EE 힘(3D, EE 좌표) 추정. watt calculate_force와 동일 원리.
+        준정적 가정. np.ndarray(3,) 반환; 불가/특이점이면 None.
+        try/except·isfinite는 값 가드가 아니라, 특이점 발산이 _loop_once의
+        모터 명령까지 죽이지 않도록 하는 예외 격리(비특이 자세 값은 watt와 동일)."""
+        if not (self._gc_ok and tau is not None and self.ee_frame_id is not None):
+            return None
+        try:
+            qnp = np.asarray(q, dtype=float)
+            J = pin.computeFrameJacobian(self.pin_model, self.pin_data, qnp,
+                                         self.ee_frame_id, pin.ReferenceFrame.LOCAL)
+            Jv = J[:3, :]                                   # 3×7 선형(EE 좌표)
+            pin.crba(self.pin_model, self.pin_data, qnp)    # data.M (상삼각만 채움)
+            M = np.triu(self.pin_data.M)
+            M = M + M.T - np.diag(np.diag(M))               # 대칭화 (crba gotcha)
+            Minv = np.linalg.inv(M)
+            J_bar = Minv @ Jv.T @ np.linalg.inv(Jv @ Minv @ Jv.T)   # 7×3, 관성가중
+            F = J_bar.T @ (np.asarray(efforts) - np.asarray(tau))   # 측정 − 중력 → 3D 힘
+        except np.linalg.LinAlgError:
+            return None                                     # 정확 특이 → 그 사이클 발행만 스킵
+        if not np.all(np.isfinite(F)):
+            return None                                     # 근처 특이 inf/nan → 스킵
+        return F
 
     ### keyboard
     def _keyboard_loop(self):
@@ -424,6 +494,8 @@ class AgxArmSimpleTeleopNode(Node):
             elif p.name == "speed_percent":
                 self.speed_percent = int(p.value)
                 self.agx_arm.set_speed_percent(self.speed_percent)
+            elif p.name == "ee_frame":
+                self._resolve_ee_frame(p.value)
             elif p.name.startswith("gravity_scale_"):
                 idx = int(p.name.rsplit("_", 1)[1]) - 1
                 if 0 <= idx < len(self.gravity_scale):
