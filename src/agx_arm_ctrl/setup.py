@@ -29,6 +29,7 @@ setup(
         'console_scripts': [
             'agx_arm_ctrl_single = agx_arm_ctrl.agx_arm_ctrl_single_node:main',
             'agx_arm_ctrl_simple = agx_arm_ctrl.agx_arm_ctrl_simple_node:main',
+            'agx_arm_ctrl_simple_teleop = agx_arm_ctrl.agx_arm_ctrl_simple_teleop_node:main',
         ],
     },
 )

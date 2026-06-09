@@ -1,0 +1,450 @@
+#!/usr/bin/env python3
+# -*-coding:utf8-*-
+"""move_p 실시간 teleop 검증용 최소 노드.
+
+키보드로 엔드(flange) pose를 6-DOF jog → 매 루프 move_p(target) 스트리밍 →
+feedback/joint_states 발행.
+
+move_p는 position-velocity(스무딩) 모드이며 "연속 실행 시 직전 목표를 덮어쓴다"고
+문서화되어 있어(move_l과 달리) 연속 스트리밍이 가능하다. 이 노드는 그 추종성을 검증한다.
+
+drag_mode(SetBool) 서비스: simple_node에서 차용한 중력보상 drag. 켜지면 move_p 스트리밍
+대신 move_mit(kp=0, t_ff=G(q))로 중력보상만 걸어 수동 핸드가이드. 끄면 현재 flange pose로
+target을 재시드해 move_p 스트리밍 복귀. Pinocchio + URDF 중력모델 필요(없으면 drag 비활성).
+
+키보드 입력이 stdin TTY를 필요로 하므로 launch가 아니라 `ros2 run`으로 실행할 것.
+"""
+import sys
+import math
+import time
+import select
+import termios
+import tty
+import atexit
+import threading
+import rclpy
+import numpy as np
+from rclpy.node import Node
+from sensor_msgs.msg import JointState
+from builtin_interfaces.msg import Time
+from std_srvs.srv import SetBool, Trigger
+from rcl_interfaces.msg import SetParametersResult, ParameterDescriptor, FloatingPointRange
+from pyAgxArm import create_agx_arm_config, AgxArmFactory, NeroFW
+
+try:
+    import pinocchio as pin
+    _HAS_PIN = True
+except ImportError:
+    _HAS_PIN = False
+
+HALF_PI = math.pi / 2.0
+
+# 키 → (축 index 0..5, 부호). 0:x 1:y 2:z 3:roll 4:pitch 5:yaw
+JOG_KEYS = {
+    "w": (0, +1), "s": (0, -1),   # x
+    "a": (1, +1), "d": (1, -1),   # y
+    "r": (2, +1), "f": (2, -1),   # z
+    "u": (3, +1), "o": (3, -1),   # roll
+    "i": (4, +1), "k": (4, -1),   # pitch
+    "j": (5, +1), "l": (5, -1),   # yaw
+}
+
+KEYMAP_BANNER = """\
+========== move_p teleop ==========
+ translation (m):  x+ w / x- s    y+ a / y- d    z+ r / z- f
+ rotation (rad):   roll+ u / roll- o   pitch+ i / pitch- k   yaw+ j / yaw- l
+ SPACE : 현재 실제 flange pose로 target 재동기화(re-sync)
+ [ / ] : linear_step  x1/1.5 / x1.5      - / = : angular_step  x1/1.5 / x1.5
+ p     : 현재 target / 실제 pose 출력
+ ESC / Ctrl-C : 종료
+===================================="""
+
+
+class AgxArmSimpleTeleopNode(Node):
+
+    def __init__(self):
+        super().__init__("agx_arm_ctrl_simple_teleop_node")
+
+        self.declare_parameter("can_port", "can0")
+        self.declare_parameter("arm_type", "nero")
+        self.declare_parameter("auto_enable", True)
+        self.declare_parameter("speed_percent", 100)
+        self.declare_parameter("pub_rate", 50)
+        self.declare_parameter("enable_timeout", 5.0)
+        self.declare_parameter(
+            "linear_step", 0.005,
+            ParameterDescriptor(
+                description="키 1회당 위치 jog 증분(m)",
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=0.1, step=0.0)],
+            ),
+        )
+        self.declare_parameter(
+            "angular_step", 0.01,
+            ParameterDescriptor(
+                description="키 1회당 자세 jog 증분(rad)",
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=0.5, step=0.0)],
+            ),
+        )
+        # drag(중력보상) 모드용 — simple_node에서 차용
+        self.declare_parameter(
+            "urdf_path",
+            "/home/yunbeom/agx_arm_ws/src/agx_arm_ros/src/agx_arm_description/agx_arm_urdf/nero/nero_handeye.urdf",
+        )
+        for j in range(1, 8):
+            self.declare_parameter(
+                f"gravity_scale_{j}", 1.0,
+                ParameterDescriptor(
+                    description=f"joint{j} 중력보상 스케일(0=무보상,1=완전)",
+                    floating_point_range=[FloatingPointRange(from_value=0.0, to_value=1.5, step=0.0)],
+                ),
+            )
+        for j in range(1, 8):
+            self.declare_parameter(
+                f"gravity_kd_{j}", 0.1,
+                ParameterDescriptor(
+                    description=f"joint{j} 가상 점성감쇠(drag)",
+                    floating_point_range=[FloatingPointRange(from_value=0.0, to_value=5.0, step=0.0)],
+                ),
+            )
+        self.can_port = self.get_parameter("can_port").value
+        self.arm_type = self.get_parameter("arm_type").value
+        self.auto_enable = self.get_parameter("auto_enable").value
+        self.speed_percent = self.get_parameter("speed_percent").value
+        self.pub_rate = self.get_parameter("pub_rate").value
+        self.enable_timeout = self.get_parameter("enable_timeout").value
+        self.linear_step = self.get_parameter("linear_step").value
+        self.angular_step = self.get_parameter("angular_step").value
+        self.urdf_path = self.get_parameter("urdf_path").value
+        self.gravity_scale = [self.get_parameter(f"gravity_scale_{j}").value for j in range(1, 8)]
+        self.gravity_kd = [self.get_parameter(f"gravity_kd_{j}").value for j in range(1, 8)]
+
+        self.enable_flag = False
+        self.control_ready = False
+        self.target = None          # [x,y,z,r,p,yaw] 목표 flange pose (없으면 스트리밍 보류)
+        self.drag_mode_active = False
+
+        self._init_arm()
+        self._init_dynamics()
+
+        self.joint_states_pub = self.create_publisher(JointState, "feedback/joint_states", 1)
+        self.create_service(Trigger, "get_robot_state", self._get_state_cb)
+        self.create_service(SetBool, "drag_mode", self._drag_cb)
+        self.add_on_set_parameters_callback(self._on_set_params)
+
+        # 모든 CAN I/O(읽기+move_p)는 이 한 스레드에서만 → 레이스 방지
+        self.loop_thread = threading.Thread(target=self._loop, daemon=True)
+        self.loop_thread.start()
+        # 키보드 입력 스레드 (target만 갱신, CAN 접근 없음)
+        self.kbd_thread = threading.Thread(target=self._keyboard_loop, daemon=True)
+        self.kbd_thread.start()
+
+        self.get_logger().info(KEYMAP_BANNER)
+
+    ### initialization
+    def _init_arm(self):
+        # Nero, 펌웨어 v111 고정 (simple_node와 동일)
+        config = create_agx_arm_config(
+            robot=self.arm_type, comm="can", channel=self.can_port,
+            firmeware_version=NeroFW.V111,
+        )
+        self.agx_arm = AgxArmFactory.create_arm(config)
+        self.agx_arm.connect()
+        self.arm_joint_names = list(config["joint_limits"].keys())
+        self.arm_joint_count = self.agx_arm.joint_nums
+
+        if self.auto_enable and not self._enable_arm(True):
+            self.get_logger().error("Failed to auto-enable the arm")
+        self.agx_arm.set_speed_percent(self.speed_percent)
+
+    def _init_dynamics(self):
+        """중력보상 모델(Pinocchio) 로드. 실패해도 노드는 정상 동작(drag만 비활성).
+        simple_node에서 차용."""
+        self._gc_ok = False
+        self.pin_model = None
+        if not _HAS_PIN:
+            self.get_logger().warn("pinocchio not available; drag(gravity-comp) disabled")
+            return
+        if not self.urdf_path:
+            self.get_logger().warn("urdf_path empty; drag(gravity-comp) disabled")
+            return
+        try:
+            self.pin_model = pin.buildModelFromUrdf(self.urdf_path)
+            self.pin_data = self.pin_model.createData()
+            if self.pin_model.nv != self.arm_joint_count:
+                self.get_logger().warn(
+                    f"URDF nv({self.pin_model.nv}) != joints({self.arm_joint_count}); check joint order"
+                )
+            self._gc_ok = True
+            self.get_logger().info(f"Gravity model loaded (nv={self.pin_model.nv})")
+        except Exception as e:
+            self.get_logger().error(f"gravity model load failed: {e}")
+
+    def _enable_arm(self, enable=True):
+        start = time.time()
+        while not (self.agx_arm.enable() if enable else self.agx_arm.disable()):
+            if time.time() - start > self.enable_timeout:
+                self.get_logger().error(f"Timeout to {'enable' if enable else 'disable'} arm")
+                return False
+            time.sleep(1)
+        self.enable_flag = enable
+        self.get_logger().info(f"Arm {'enabled' if enable else 'disabled'}")
+        return True
+
+    ### helpers
+    def _to_ros_time(self, ts):
+        t = Time()
+        t.sec = int(ts)
+        t.nanosec = int((ts - t.sec) * 1e9)
+        return t
+
+    def _arm_ready(self):
+        js = self.agx_arm.get_joint_angles()
+        return js is not None and js.hz > 0
+
+    def _read_flange_pose(self):
+        """현재 flange pose [x,y,z,r,p,yaw] 또는 None."""
+        fp = self.agx_arm.get_flange_pose()
+        if fp is None or fp.hz <= 0:
+            return None
+        return list(fp.msg)
+
+    @staticmethod
+    def _wrap_pi(a):
+        return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+    def _sanitize(self, pose):
+        """move_p 자세 범위로 정리: roll/yaw∈[-π,π], pitch∈(-π/2,π/2)."""
+        x, y, z, r, p, yw = pose
+        r = self._wrap_pi(r)
+        yw = self._wrap_pi(yw)
+        eps = 1e-3
+        p = max(-HALF_PI + eps, min(HALF_PI - eps, p))
+        return [x, y, z, r, p, yw]
+
+    ### control loop (sole CAN owner)
+    def _loop(self):
+        while rclpy.ok():
+            t0 = time.perf_counter()
+            try:
+                self._loop_once()
+            except Exception as e:
+                self.get_logger().warn(f"loop error: {e}", throttle_duration_sec=1.0)
+            dt = 1.0 / max(1, self.pub_rate) - (time.perf_counter() - t0)
+            if dt > 0:
+                time.sleep(dt)
+
+    def _loop_once(self):
+        if not self.agx_arm.is_ok():
+            return
+        if not self.control_ready and self._arm_ready():
+            self.control_ready = True
+            self.get_logger().info("Agx_arm feedback is ready, control enabled")
+
+        js = self.agx_arm.get_joint_angles()
+        if js is None or js.hz <= 0:
+            return
+        q = list(js.msg)
+
+        # feedback/joint_states (position only)
+        msg = JointState()
+        msg.header.stamp = self._to_ros_time(js.timestamp)
+        msg.name = list(self.arm_joint_names)
+        msg.position = q
+        self.joint_states_pub.publish(msg)
+
+        # drag(중력보상) 모드: move_p 스트리밍 대신 move_mit 중력보상만
+        if self.drag_mode_active and self._gc_ok:
+            self._drag_once(q)
+            return
+
+        # target 최초/드래그 해제 후 시드: 현재 flange pose
+        if self.target is None:
+            seed = self._read_flange_pose()
+            if seed is None:
+                return                      # flange pose 아직 → 스트리밍 보류
+            self.target = self._sanitize(seed)
+            self.get_logger().info(
+                "target seeded: [" + ", ".join(f"{v:+.3f}" for v in self.target) + "]"
+            )
+
+        # 매 루프 move_p 스트리밍 (원자적 스냅샷)
+        target = self.target
+        self.agx_arm.move_p(list(target))
+
+    def _drag_once(self, q):
+        """중력보상 drag: 관절별 move_mit(kp=0, kd=gravity_kd, t_ff=gravity_scale*G(q)).
+        simple_node에서 차용. target을 None으로 비워 drag 해제 시 현재 flange pose로 재시드."""
+        self.target = None
+        tau = pin.computeGeneralizedGravity(
+            self.pin_model, self.pin_data, np.asarray(q, dtype=float)
+        )
+        for i in range(self.arm_joint_count):
+            self.agx_arm.move_mit(
+                joint_index=i + 1, p_des=0.0, v_des=0.0,
+                kp=0.0, kd=self.gravity_kd[i],
+                t_ff=float(self.gravity_scale[i] * tau[i]),
+            )
+
+    ### keyboard
+    def _keyboard_loop(self):
+        if not sys.stdin.isatty():
+            self.get_logger().error(
+                "stdin is not a TTY; keyboard teleop disabled. Run with `ros2 run` in a terminal."
+            )
+            return
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        atexit.register(termios.tcsetattr, fd, termios.TCSADRAIN, old)
+        try:
+            tty.setcbreak(fd)
+            while rclpy.ok():
+                if not select.select([sys.stdin], [], [], 0.1)[0]:
+                    continue
+                ch = sys.stdin.read(1)
+                if ch == "\x03" or ch == "\x1b":   # Ctrl-C / ESC
+                    self.get_logger().info("quit key received")
+                    rclpy.shutdown()
+                    break
+                self._handle_key(ch)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+    def _handle_key(self, ch):
+        if self.target is None:
+            return                              # 아직 시드 전
+        if ch in JOG_KEYS:
+            axis, sign = JOG_KEYS[ch]
+            step = self.linear_step if axis < 3 else self.angular_step
+            t = list(self.target)
+            t[axis] += sign * step
+            self.target = self._sanitize(t)     # 통째 교체 → GIL 하 원자적
+        elif ch == " ":
+            seed = self._read_flange_pose()
+            if seed is not None:
+                self.target = self._sanitize(seed)
+                self.get_logger().info("target re-synced to current flange pose")
+        elif ch == "[":
+            self.linear_step = max(1e-4, self.linear_step / 1.5)
+            self.get_logger().info(f"linear_step={self.linear_step:.4f} m")
+        elif ch == "]":
+            self.linear_step = min(0.1, self.linear_step * 1.5)
+            self.get_logger().info(f"linear_step={self.linear_step:.4f} m")
+        elif ch == "-":
+            self.angular_step = max(1e-4, self.angular_step / 1.5)
+            self.get_logger().info(f"angular_step={self.angular_step:.4f} rad")
+        elif ch == "=":
+            self.angular_step = min(0.5, self.angular_step * 1.5)
+            self.get_logger().info(f"angular_step={self.angular_step:.4f} rad")
+        elif ch == "p":
+            actual = self._read_flange_pose()
+            tgt = "[" + ", ".join(f"{v:+.3f}" for v in self.target) + "]"
+            act = ("[" + ", ".join(f"{v:+.3f}" for v in actual) + "]") if actual else "unavailable"
+            self.get_logger().info(f"target={tgt}  actual={act}")
+
+    def _drag_cb(self, request, response):
+        """중력보상 drag on/off (SetBool). simple_node에서 차용.
+        on이면 _loop_once가 move_p 대신 중력보상 move_mit를 송신, off면 move_p 복귀."""
+        if request.data and not self._gc_ok:
+            response.success = False
+            response.message = "gravity model not loaded; cannot enter drag"
+            self.get_logger().warn(response.message)
+            return response
+        if request.data and not self.enable_flag:
+            response.success = False
+            response.message = "enable arm before drag"
+            self.get_logger().warn(response.message)
+            return response
+        self.drag_mode_active = bool(request.data)
+        if not self.drag_mode_active:
+            self.target = None          # 해제: 현재 flange pose로 재시드 후 move_p 복귀
+        response.success = True
+        response.message = f"Drag(gravity-comp) {'on' if request.data else 'off'}"
+        self.get_logger().info(response.message)
+        return response
+
+    def _get_state_cb(self, request, response):
+        """현재 로봇/모터 상태 조회 (Trigger). simple_node의 get_robot_state에서 차용.
+        관절별 motor_states(position/velocity/current/torque)를 보고한다. CAN 읽기 전용
+        (캐시 데이터 조회)이라 루프 스레드의 move_p 송신과 충돌하지 않는다."""
+        lines = [
+            f"enabled={self.enable_flag}  control_ready={self.control_ready}  "
+            f"pub_rate={self.pub_rate}Hz  speed={self.speed_percent}%",
+            f"step: linear={self.linear_step:.4f}m  angular={self.angular_step:.4f}rad",
+            f"drag={self.drag_mode_active}  gc_ok={self._gc_ok}"
+            + "  scale=[" + ",".join(f"{s:.2f}" for s in self.gravity_scale) + "]"
+            + "  kd=[" + ",".join(f"{k:.2f}" for k in self.gravity_kd) + "]",
+        ]
+        if self.target is not None:
+            lines.append("target    =[" + ", ".join(f"{v:+.3f}" for v in self.target) + "]")
+        else:
+            lines.append("target    =unseeded")
+        actual = self._read_flange_pose()
+        if actual is not None:
+            lines.append("flange    =[" + ", ".join(f"{v:+.3f}" for v in actual) + "]")
+        else:
+            lines.append("flange    =unavailable")
+        js = self.agx_arm.get_joint_angles()
+        q = list(js.msg) if (js is not None and js.hz > 0) else None
+        if q is not None:
+            lines.append("q[rad]    =[" + ", ".join(f"{v:+.3f}" for v in q) + "]")
+        else:
+            lines.append("q[rad]    =unavailable")
+
+        # 관절별 모터 상태: 위치/속도/전류/토크
+        pos, vel, cur, tau = [], [], [], []
+        for j in range(1, self.arm_joint_count + 1):
+            ms = self.agx_arm.get_motor_states(j)
+            pos.append(ms.msg.position if ms is not None else float("nan"))
+            vel.append(ms.msg.velocity if ms is not None else float("nan"))
+            cur.append(ms.msg.current if ms is not None else float("nan"))
+            tau.append(ms.msg.torque if ms is not None else float("nan"))
+        lines.append("motor pos =[" + ", ".join(f"{v:+.3f}" for v in pos) + "] rad")
+        lines.append("motor vel =[" + ", ".join(f"{v:+.3f}" for v in vel) + "] rad/s")
+        lines.append("motor cur =[" + ", ".join(f"{v:+.2f}" for v in cur) + "] A")
+        lines.append("motor tau =[" + ", ".join(f"{v:+.2f}" for v in tau) + "] N.m")
+
+        st = self.agx_arm.get_arm_status()
+        if st is not None:
+            lines.append(
+                f"ctrl_mode={st.msg.ctrl_mode}  arm_status={st.msg.arm_status}  "
+                f"motion_status={st.msg.motion_status}"
+            )
+        response.success = True
+        response.message = "\n".join(lines)
+        return response
+
+    def _on_set_params(self, params):
+        for p in params:
+            if p.name == "pub_rate":
+                self.pub_rate = max(1, int(p.value))
+            elif p.name == "linear_step":
+                self.linear_step = max(0.0, float(p.value))
+            elif p.name == "angular_step":
+                self.angular_step = max(0.0, float(p.value))
+            elif p.name == "speed_percent":
+                self.speed_percent = int(p.value)
+                self.agx_arm.set_speed_percent(self.speed_percent)
+            elif p.name.startswith("gravity_scale_"):
+                idx = int(p.name.rsplit("_", 1)[1]) - 1
+                if 0 <= idx < len(self.gravity_scale):
+                    self.gravity_scale[idx] = max(0.0, min(1.5, float(p.value)))
+            elif p.name.startswith("gravity_kd_"):
+                idx = int(p.name.rsplit("_", 1)[1]) - 1
+                if 0 <= idx < len(self.gravity_kd):
+                    self.gravity_kd[idx] = max(0.0, min(5.0, float(p.value)))
+        return SetParametersResult(successful=True)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    try:
+        rclpy.spin(AgxArmSimpleTeleopNode())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
