@@ -31,6 +31,7 @@ from builtin_interfaces.msg import Time
 from std_srvs.srv import SetBool, Trigger
 from rcl_interfaces.msg import SetParametersResult, ParameterDescriptor, FloatingPointRange
 from pyAgxArm import create_agx_arm_config, AgxArmFactory, NeroFW
+from scipy.spatial.transform import Rotation as _Rot
 
 try:
     import pinocchio as pin
@@ -59,6 +60,31 @@ KEYMAP_BANNER = """\
  p     : 현재 target / 실제 pose 출력
  ESC / Ctrl-C : 종료
 ===================================="""
+
+
+# ── pose 변환 헬퍼 (T = (R 3×3, p 3)). 계산 전용, I/O 없음 ──
+def _euler_to_R(rpy):
+    return _Rot.from_euler("xyz", rpy).as_matrix()
+
+
+def _R_to_euler(Rm):
+    return _Rot.from_matrix(Rm).as_euler("xyz")
+
+
+def _rotvec_to_R(v):
+    return _Rot.from_rotvec(v).as_matrix()
+
+
+def _compose(Ta, Tb):
+    Ra, pa = Ta
+    Rb, pb = Tb
+    return (Ra @ Rb, pa + Ra @ pb)
+
+
+def _inverse(T):
+    Rm, p = T
+    Rt = Rm.T
+    return (Rt, -Rt @ p)
 
 
 class AgxArmSimpleTeleopNode(Node):
@@ -126,6 +152,7 @@ class AgxArmSimpleTeleopNode(Node):
         self.control_ready = False
         self.target = None          # [x,y,z,r,p,yaw] 목표 flange pose (없으면 스트리밍 보류)
         self.drag_mode_active = False
+        self.T_ft = None            # flange→tool(end_point_link) 상수 변환 (자동보정, 1회)
 
         self._init_arm()
         self._init_dynamics()
@@ -133,6 +160,10 @@ class AgxArmSimpleTeleopNode(Node):
         self.joint_states_pub = self.create_publisher(JointState, "feedback/joint_states", 1)
         # 관성가중 토크-잔차 EE 힘 추정 (watt calculate_force와 동일 원리)
         self.ee_force_pub = self.create_publisher(WrenchStamped, "feedback/endeffector_force", 1)
+        # move_mit이 함의하는 기대 토크 T_ref (move_p면 중력 기준선)
+        self.expected_mit_torque_pub = self.create_publisher(
+            JointState, "feedback/expected_mit_torque", 1
+        )
         self.create_service(Trigger, "get_robot_state", self._get_state_cb)
         self.create_service(SetBool, "drag_mode", self._drag_cb)
         self.add_on_set_parameters_callback(self._on_set_params)
@@ -229,6 +260,39 @@ class AgxArmSimpleTeleopNode(Node):
         p = max(-HALF_PI + eps, min(HALF_PI - eps, p))
         return [x, y, z, r, p, yw]
 
+    def _ensure_flange_tool(self, q):
+        """flange↔tool(end_point_link) 상수 변환 1회 산출 (루프 스레드).
+        SDK flange 포즈 + Pinocchio tool FK 자동보정 — SDK flange가 URDF 어느 링크인지 몰라도 됨."""
+        if self.T_ft is not None or not self._gc_ok or self.ee_frame_id is None:
+            return
+        fp = self._read_flange_pose()
+        if fp is None:
+            return
+        pin.framesForwardKinematics(self.pin_model, self.pin_data, np.asarray(q, dtype=float))
+        oMf = self.pin_data.oMf[self.ee_frame_id]
+        T_bt = (np.array(oMf.rotation), np.array(oMf.translation))      # base→tool (Pinocchio)
+        T_bf = (_euler_to_R(fp[3:6]), np.asarray(fp[:3], dtype=float))  # base→flange (SDK)
+        self.T_ft = _compose(_inverse(T_bf), T_bt)                     # flange→tool 상수
+        Rft, pft = self.T_ft
+        self.get_logger().info(
+            f"flange->tool calib: |p|={np.linalg.norm(pft):.4f} m  rpy={np.round(_R_to_euler(Rft), 3)}"
+        )
+
+    def _jog_tool_frame(self, F, axis, sign):
+        """flange pose F에 EE(tool) 프레임 jog 1스텝 적용 → 새 flange pose 리스트.
+        이동(axis<3): tool 축 직선. 회전(axis>=3): tool 팁 둘레. 순수 math(스레드 안전)."""
+        T_bf = (_euler_to_R(F[3:6]), np.asarray(F[:3], dtype=float))
+        T_bt = _compose(T_bf, self.T_ft)                    # base→tool
+        e = np.zeros(3)
+        e[axis % 3] = float(sign)
+        if axis < 3:                                        # 이동: tool 축
+            dT = (np.eye(3), e * self.linear_step)
+        else:                                               # 회전: tool 팁 둘레
+            dT = (_rotvec_to_R(e * self.angular_step), np.zeros(3))
+        T_bt_new = _compose(T_bt, dT)                       # 우곱 = 툴(바디) 델타
+        Rm, p = _compose(T_bt_new, _inverse(self.T_ft))     # 다시 base→flange
+        return [float(p[0]), float(p[1]), float(p[2]), *[float(a) for a in _R_to_euler(Rm)]]
+
     ### control loop (sole CAN owner)
     def _loop(self):
         while rclpy.ok():
@@ -269,20 +333,31 @@ class AgxArmSimpleTeleopNode(Node):
         msg.effort = efforts
         self.joint_states_pub.publish(msg)
 
-        # endeffector_force: 관성가중 토크-잔차로 EE 힘 추정·발행 (drag/move_p 무관 매 주기)
-        if self._gc_ok and self.ee_frame_id is not None:
+        # 중력 G(q): expected_mit_torque + endeffector_force 공용 (gc_ok 시 매 주기)
+        if self._gc_ok:
+            self._ensure_flange_tool(q)        # flange↔tool 변환 1회 보정(EE축 jog용)
             tau_g = pin.computeGeneralizedGravity(
                 self.pin_model, self.pin_data, np.asarray(q, dtype=float)
             )
-            F = self._estimate_ee_force(q, efforts, tau_g)
-            if F is not None:
-                w = WrenchStamped()
-                w.header.stamp = msg.header.stamp
-                w.header.frame_id = self.ee_frame
-                w.wrench.force.x = float(F[0])
-                w.wrench.force.y = float(F[1])
-                w.wrench.force.z = float(F[2])
-                self.ee_force_pub.publish(w)
+
+            # expected_mit_torque: move_mit 기대 T_ref (move_p면 중력 기준선)
+            em = JointState()
+            em.header.stamp = msg.header.stamp
+            em.name = list(self.arm_joint_names)
+            em.effort = self._expected_mit_torque(tau_g, velocities)
+            self.expected_mit_torque_pub.publish(em)
+
+            # endeffector_force: 관성가중 토크-잔차로 EE 힘 추정 (drag/move_p 무관)
+            if self.ee_frame_id is not None:
+                F = self._estimate_ee_force(q, efforts, tau_g)
+                if F is not None:
+                    w = WrenchStamped()
+                    w.header.stamp = msg.header.stamp
+                    w.header.frame_id = self.ee_frame
+                    w.wrench.force.x = float(F[0])
+                    w.wrench.force.y = float(F[1])
+                    w.wrench.force.z = float(F[2])
+                    self.ee_force_pub.publish(w)
 
         # drag(중력보상) 모드: move_p 스트리밍 대신 move_mit 중력보상만
         if self.drag_mode_active and self._gc_ok:
@@ -355,6 +430,16 @@ class AgxArmSimpleTeleopNode(Node):
             return None                                     # 근처 특이 inf/nan → 스킵
         return F
 
+    def _expected_mit_torque(self, tau, velocities):
+        """move_mit이 함의하는 기대 토크 T_ref = kp(p_des−q)+kd(v_des−v)+t_ff 리스트.
+        drag(kp=0): kd*(0−v) + gravity_scale*G(q) (= _drag_once가 보내는 명령).
+        move_p(MIT 미사용): G(q) 기준선."""
+        if self.drag_mode_active:
+            return [float(self.gravity_kd[i] * (0.0 - velocities[i])
+                          + self.gravity_scale[i] * tau[i])
+                    for i in range(self.arm_joint_count)]
+        return [float(v) for v in tau]                      # move_p: 중력 기준선
+
     ### keyboard
     def _keyboard_loop(self):
         if not sys.stdin.isatty():
@@ -384,10 +469,15 @@ class AgxArmSimpleTeleopNode(Node):
             return                              # 아직 시드 전
         if ch in JOG_KEYS:
             axis, sign = JOG_KEYS[ch]
-            step = self.linear_step if axis < 3 else self.angular_step
-            t = list(self.target)
-            t[axis] += sign * step
-            self.target = self._sanitize(t)     # 통째 교체 → GIL 하 원자적
+            if self.T_ft is None:
+                # 폴백: flange↔tool 미보정(Pinocchio 없음 등) → 기존 base 증분
+                step = self.linear_step if axis < 3 else self.angular_step
+                t = list(self.target)
+                t[axis] += sign * step
+                self.target = self._sanitize(t)
+            else:
+                # EE(tool) 프레임 jog → 새 flange pose (통째 교체: GIL 하 원자적)
+                self.target = self._sanitize(self._jog_tool_frame(self.target, axis, sign))
         elif ch == " ":
             seed = self._read_flange_pose()
             if seed is not None:
