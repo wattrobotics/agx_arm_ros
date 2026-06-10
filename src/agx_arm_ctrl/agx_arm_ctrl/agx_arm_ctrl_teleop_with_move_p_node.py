@@ -12,6 +12,10 @@ drag_mode(SetBool) 서비스: simple_node에서 차용한 중력보상 drag. 켜
 대신 move_mit(kp=0, t_ff=G(q))로 중력보상만 걸어 수동 핸드가이드. 끄면 현재 flange pose로
 target을 재시드해 move_p 스트리밍 복귀. Pinocchio + URDF 중력모델 필요(없으면 drag 비활성).
 
+probe_z(Trigger): tool -z로 일정 스텝 전진 → |F_z| 임계 접촉 → 시작 pose로 복귀.
+probe_z2(Trigger): 동일하되 스텝을 감속(decel)시켜 처음엔 큰 스텝, 목표(probe_max_distance)
+근처로 갈수록 작은 스텝으로 접근. 접촉 시 조기 정지·시작 pose 복귀는 probe_z와 동일.
+
 키보드 입력이 stdin TTY를 필요로 하므로 launch가 아니라 `ros2 run`으로 실행할 것.
 """
 import sys
@@ -40,6 +44,7 @@ except ImportError:
     _HAS_PIN = False
 
 HALF_PI = math.pi / 2.0
+PROBE_CONSEC = 3            # probe 접촉 판정 디바운스(연속 주기 수)
 
 # 키 → (축 index 0..5, 부호). 0:x 1:y 2:z 3:roll 4:pitch 5:yaw
 JOG_KEYS = {
@@ -87,10 +92,10 @@ def _inverse(T):
     return (Rt, -Rt @ p)
 
 
-class AgxArmSimpleTeleopNode(Node):
+class AgxArmTeleopWithMovePNode(Node):
 
     def __init__(self):
-        super().__init__("agx_arm_ctrl_simple_teleop_node")
+        super().__init__("agx_arm_ctrl_teleop_with_move_p_node")
 
         self.declare_parameter("can_port", "can0")
         self.declare_parameter("arm_type", "nero")
@@ -135,6 +140,43 @@ class AgxArmSimpleTeleopNode(Node):
                     floating_point_range=[FloatingPointRange(from_value=0.0, to_value=5.0, step=0.0)],
                 ),
             )
+        # probe_z 서비스: tool -z 전진 → |F_z| 임계 접촉 → 전진거리만큼 복귀
+        self.declare_parameter(
+            "probe_force_threshold", 5.0,
+            ParameterDescriptor(
+                description="probe 접촉 판정 |F_z| 임계(N, EE프레임)",
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=50.0, step=0.0)],
+            ),
+        )
+        self.declare_parameter(
+            "probe_speed", 0.01,
+            ParameterDescriptor(
+                description="probe 전진/복귀 속도(m/s)",
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=0.1, step=0.0)],
+            ),
+        )
+        self.declare_parameter(
+            "probe_max_distance", 0.05,
+            ParameterDescriptor(
+                description="probe 안전 최대 전진거리(m). probe_z2의 감속 목표 거리 겸용",
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=0.3, step=0.0)],
+            ),
+        )
+        # probe_z2(감속 probe): 목표(probe_max_distance)에서 멀면 빠르게, 가까우면 느리게
+        self.declare_parameter(
+            "probe2_speed_max", 0.03,
+            ParameterDescriptor(
+                description="probe_z2 초기(목표에서 먼) 전진 속도(m/s) = 큰 스텝",
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=0.2, step=0.0)],
+            ),
+        )
+        self.declare_parameter(
+            "probe2_speed_min", 0.005,
+            ParameterDescriptor(
+                description="probe_z2 최종(목표 근처) 전진 속도(m/s) = 작은 스텝",
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=0.1, step=0.0)],
+            ),
+        )
         self.can_port = self.get_parameter("can_port").value
         self.arm_type = self.get_parameter("arm_type").value
         self.auto_enable = self.get_parameter("auto_enable").value
@@ -147,12 +189,25 @@ class AgxArmSimpleTeleopNode(Node):
         self.ee_frame = self.get_parameter("ee_frame").value
         self.gravity_scale = [self.get_parameter(f"gravity_scale_{j}").value for j in range(1, 8)]
         self.gravity_kd = [self.get_parameter(f"gravity_kd_{j}").value for j in range(1, 8)]
+        self.probe_force_threshold = self.get_parameter("probe_force_threshold").value
+        self.probe_speed = self.get_parameter("probe_speed").value
+        self.probe_max_distance = self.get_parameter("probe_max_distance").value
+        self.probe2_speed_max = self.get_parameter("probe2_speed_max").value
+        self.probe2_speed_min = self.get_parameter("probe2_speed_min").value
 
         self.enable_flag = False
         self.control_ready = False
         self.target = None          # [x,y,z,r,p,yaw] 목표 flange pose (없으면 스트리밍 보류)
         self.drag_mode_active = False
         self.T_ft = None            # flange→tool(end_point_link) 상수 변환 (자동보정, 1회)
+        # probe_z 상태
+        self.probe_active = False
+        self.probe_phase = None      # 'approach' / 'retract'
+        self.probe_mode = "const"    # 'const'(probe_z 일정스텝) / 'decel'(probe_z2 감속)
+        self.probe_traveled = 0.0
+        self.probe_start_target = None
+        self.probe_result = None     # (success, message)
+        self._probe_consec = 0
 
         self._init_arm()
         self._init_dynamics()
@@ -166,6 +221,8 @@ class AgxArmSimpleTeleopNode(Node):
         )
         self.create_service(Trigger, "get_robot_state", self._get_state_cb)
         self.create_service(SetBool, "drag_mode", self._drag_cb)
+        self.create_service(Trigger, "probe_z", self._probe_cb)
+        self.create_service(Trigger, "probe_z2", self._probe2_cb)
         self.add_on_set_parameters_callback(self._on_set_params)
 
         # 모든 CAN I/O(읽기+move_p)는 이 한 스레드에서만 → 레이스 방지
@@ -293,6 +350,60 @@ class AgxArmSimpleTeleopNode(Node):
         Rm, p = _compose(T_bt_new, _inverse(self.T_ft))     # 다시 base→flange
         return [float(p[0]), float(p[1]), float(p[2]), *[float(a) for a in _R_to_euler(Rm)]]
 
+    def _step_tool_z(self, F, dist):
+        """flange pose F를 tool z축으로 dist[m] 평행이동(회전 불변) → 새 flange pose 리스트."""
+        R_bt = _euler_to_R(F[3:6]) @ self.T_ft[0]           # tool 회전(base)
+        zdir = R_bt @ np.array([0.0, 0.0, 1.0])
+        p = np.asarray(F[:3], dtype=float) + float(dist) * zdir
+        return [float(p[0]), float(p[1]), float(p[2]), F[3], F[4], F[5]]
+
+    def _probe_step(self, F):
+        """probe 상태기계(루프 스레드). tool -z 전진 → |F_z|≥임계 접촉 → 전진거리만큼 복귀.
+        F: EE프레임 추정힘(없으면 None→그 주기 미접촉). 모든 move_p는 이 루프 스레드에서만.
+        probe_mode='const'(probe_z)는 일정 스텝, 'decel'(probe_z2)은 목표 근처로 갈수록 감속."""
+        fz = abs(float(F[2])) if F is not None else 0.0
+        if self.probe_phase == "approach":
+            self._probe_consec = (self._probe_consec + 1) if fz >= self.probe_force_threshold else 0
+            if self._probe_consec >= PROBE_CONSEC:
+                self.probe_result = (True, f"contact Fz={fz:.2f}N @ {self.probe_traveled:.4f}m")
+                self.probe_phase = "retract"
+            elif self.probe_traveled >= self.probe_max_distance:
+                self.probe_result = (False, f"no contact within {self.probe_max_distance:.3f}m")
+                self.probe_phase = "retract"
+            else:
+                step = self._probe_approach_step()                # 'decel'이면 감속, 'const'면 일정
+                self.target = self._sanitize(self._step_tool_z(self.target, -step))   # -z 전진
+                self.probe_traveled += step
+        elif self.probe_phase == "retract":
+            if self.probe_traveled <= 1e-9:
+                self.target = list(self.probe_start_target)   # 정확 복귀(잔차 제거)
+                self.probe_active = False
+                self.probe_phase = None
+            else:
+                back = min(self._probe_retract_step(), self.probe_traveled)
+                self.target = self._sanitize(self._step_tool_z(self.target, +back))
+                self.probe_traveled -= back
+        if self.target is not None:
+            self.agx_arm.move_p(list(self.target))            # 루프 스레드 CAN
+
+    def _probe_approach_step(self):
+        """approach 1주기 전진 스텝(m). 'const'=일정(probe_speed),
+        'decel'=남은거리 비례 선형 감속(시작 speed_max → 목표 speed_min). speed_min>0 하한이
+        목표(probe_max_distance) 도달·정상 종료를 보장."""
+        rate = max(1, self.pub_rate)
+        if self.probe_mode == "decel":
+            remaining = max(0.0, self.probe_max_distance - self.probe_traveled)
+            frac = remaining / self.probe_max_distance if self.probe_max_distance > 1e-9 else 0.0
+            v = self.probe2_speed_min + (self.probe2_speed_max - self.probe2_speed_min) * frac
+            return v / rate
+        return self.probe_speed / rate
+
+    def _probe_retract_step(self):
+        """retract 1주기 복귀 스텝(m). 'decel'은 빠른 복귀(speed_max), 'const'는 probe_speed."""
+        rate = max(1, self.pub_rate)
+        v = self.probe2_speed_max if self.probe_mode == "decel" else self.probe_speed
+        return v / rate
+
     ### control loop (sole CAN owner)
     def _loop(self):
         while rclpy.ok():
@@ -334,6 +445,7 @@ class AgxArmSimpleTeleopNode(Node):
         self.joint_states_pub.publish(msg)
 
         # 중력 G(q): expected_mit_torque + endeffector_force 공용 (gc_ok 시 매 주기)
+        F = None
         if self._gc_ok:
             self._ensure_flange_tool(q)        # flange↔tool 변환 1회 보정(EE축 jog용)
             tau_g = pin.computeGeneralizedGravity(
@@ -358,6 +470,11 @@ class AgxArmSimpleTeleopNode(Node):
                     w.wrench.force.y = float(F[1])
                     w.wrench.force.z = float(F[2])
                     self.ee_force_pub.publish(w)
+
+        # probe_z: tool -z 전진 → 접촉 → 복귀 상태기계 (teleop·drag와 배타)
+        if self.probe_active:
+            self._probe_step(F)
+            return
 
         # drag(중력보상) 모드: move_p 스트리밍 대신 move_mit 중력보상만
         if self.drag_mode_active and self._gc_ok:
@@ -465,8 +582,8 @@ class AgxArmSimpleTeleopNode(Node):
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
     def _handle_key(self, ch):
-        if self.target is None:
-            return                              # 아직 시드 전
+        if self.target is None or self.probe_active:
+            return                              # 미시드 / probe 동작 중 → teleop 차단
         if ch in JOG_KEYS:
             axis, sign = JOG_KEYS[ch]
             if self.T_ft is None:
@@ -514,12 +631,68 @@ class AgxArmSimpleTeleopNode(Node):
             response.message = "enable arm before drag"
             self.get_logger().warn(response.message)
             return response
+        if request.data and self.probe_active:
+            response.success = False
+            response.message = "probe in progress; cannot enter drag"
+            self.get_logger().warn(response.message)
+            return response
         self.drag_mode_active = bool(request.data)
         if not self.drag_mode_active:
             self.target = None          # 해제: 현재 flange pose로 재시드 후 move_p 복귀
         response.success = True
         response.message = f"Drag(gravity-comp) {'on' if request.data else 'off'}"
         self.get_logger().info(response.message)
+        return response
+
+    def _probe_cb(self, request, response):
+        """probe_z (Trigger): tool -z 일정 스텝 전진 → |F_z|≥임계 접촉 → 전진거리만큼 복귀."""
+        return self._run_probe("const", "probe_z", response)
+
+    def _probe2_cb(self, request, response):
+        """probe_z2 (Trigger): probe_z와 동일하되 목표(probe_max_distance) 근처로 갈수록
+        스텝을 감속(speed_max→speed_min)시켜 처음엔 빠르게·끝엔 부드럽게 접근."""
+        return self._run_probe("decel", "probe_z2", response)
+
+    def _run_probe(self, mode, name, response):
+        """probe_z / probe_z2 공통: 사전조건 검사 → 셋업 → 완료까지 블로킹.
+        동작 중 teleop·drag 차단. force 추정(Pinocchio + ee_frame + T_ft) 필요.
+        mode='const'(일정 스텝) / 'decel'(감속). 모든 move_p는 루프 스레드가 송신."""
+        if not self.enable_flag:
+            response.success, response.message = False, "enable arm before probe"
+            return response
+        if not (self._gc_ok and self.ee_frame_id is not None) or self.T_ft is None:
+            response.success, response.message = False, "force model/frame not ready"
+            return response
+        if self.drag_mode_active:
+            response.success, response.message = False, "disable drag before probe"
+            return response
+        if self.probe_active:
+            response.success, response.message = False, "probe already running"
+            return response
+        if self.target is None:
+            response.success, response.message = False, "target not seeded yet"
+            return response
+        # 셋업 후 루프 스레드가 인계 (probe_active를 마지막에 set)
+        self.probe_mode = mode
+        self.probe_start_target = list(self.target)
+        self.probe_traveled = 0.0
+        self._probe_consec = 0
+        self.probe_result = None
+        self.probe_phase = "approach"
+        self.probe_active = True
+        slow = self.probe2_speed_min if mode == "decel" else self.probe_speed
+        timeout = 2.0 * self.probe_max_distance / max(slow, 1e-3) + 10.0
+        t0 = time.time()
+        while self.probe_active and rclpy.ok():
+            if time.time() - t0 > timeout:
+                self.probe_active = False
+                response.success, response.message = False, "probe timeout"
+                self.get_logger().warn(f"{name}: timeout")
+                return response
+            time.sleep(0.02)
+        ok, msg = self.probe_result or (False, "probe ended")
+        response.success, response.message = ok, msg
+        self.get_logger().info(f"{name}: {msg}")
         return response
 
     def _get_state_cb(self, request, response):
@@ -586,6 +759,16 @@ class AgxArmSimpleTeleopNode(Node):
                 self.agx_arm.set_speed_percent(self.speed_percent)
             elif p.name == "ee_frame":
                 self._resolve_ee_frame(p.value)
+            elif p.name == "probe_force_threshold":
+                self.probe_force_threshold = max(0.0, float(p.value))
+            elif p.name == "probe_speed":
+                self.probe_speed = max(0.0, float(p.value))
+            elif p.name == "probe_max_distance":
+                self.probe_max_distance = max(0.0, float(p.value))
+            elif p.name == "probe2_speed_max":
+                self.probe2_speed_max = max(0.0, float(p.value))
+            elif p.name == "probe2_speed_min":
+                self.probe2_speed_min = max(0.0, float(p.value))
             elif p.name.startswith("gravity_scale_"):
                 idx = int(p.name.rsplit("_", 1)[1]) - 1
                 if 0 <= idx < len(self.gravity_scale):
@@ -600,7 +783,7 @@ class AgxArmSimpleTeleopNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     try:
-        rclpy.spin(AgxArmSimpleTeleopNode())
+        rclpy.spin(AgxArmTeleopWithMovePNode())
     except KeyboardInterrupt:
         pass
     finally:
