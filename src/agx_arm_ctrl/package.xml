@@ -14,6 +14,7 @@
   <depend>std_srvs</depend>
   <depend>action_msgs</depend>
   <depend>builtin_interfaces</depend>
+  <depend>controller_manager_msgs</depend>
   <depend>agx_arm_msgs</depend>
   <depend>launch</depend>
   <depend>launch_ros</depend>
