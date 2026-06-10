@@ -77,9 +77,17 @@ class NeroHardwareInterface(Node):
             self.declare_parameter(f"gravity_kd_{j}", 0.05)     # drag 가상 점성감쇠
         # 평상시 MIT 임피던스 게인(drag의 gravity_kd와 별개)
         for j in range(1, 8):
-            self.declare_parameter(f"mit_kp_{j}", 10.0)         # 위치강성
+            self.declare_parameter(f"mit_kp_{j}", 25.0)         # 위치강성
         for j in range(1, 8):
             self.declare_parameter(f"mit_kd_{j}", 0.8)          # 감쇠
+        # 자동 drag 가드: 측정토크 vs 중력모델 편차가 임계를 window초 지속하면 자동 진입,
+        # drag 중 자세가 settle_window초 정지하면 자동 탈출(수동 진입 포함). 쿨다운 없음.
+        self.declare_parameter("auto_drag_guard_enabled", True)
+        self.declare_parameter("deviation_torque_threshold", 3.0)   # N.m, 정상 추종토크보다 크게
+        self.declare_parameter("deviation_window_sec", 0.3)
+        self.declare_parameter("drag_auto_exit_enabled", True)
+        self.declare_parameter("settle_window_sec", 3.0)
+        self.declare_parameter("settle_still_deg", 5.0)
 
         self.can_port = self.get_parameter("can_port").value
         self.arm_type = self.get_parameter("arm_type").value
@@ -99,6 +107,12 @@ class NeroHardwareInterface(Node):
         self.gravity_kd = [self.get_parameter(f"gravity_kd_{j}").value for j in range(1, 8)]
         self.mit_kp = [self.get_parameter(f"mit_kp_{j}").value for j in range(1, 8)]
         self.mit_kd = [self.get_parameter(f"mit_kd_{j}").value for j in range(1, 8)]
+        self.auto_drag_guard_on = self.get_parameter("auto_drag_guard_enabled").value
+        self.deviation_torque_threshold = self.get_parameter("deviation_torque_threshold").value
+        self.deviation_window_sec = self.get_parameter("deviation_window_sec").value
+        self.drag_auto_exit_on = self.get_parameter("drag_auto_exit_enabled").value
+        self.settle_window_sec = self.get_parameter("settle_window_sec").value
+        self.settle_still_deg = self.get_parameter("settle_still_deg").value
 
         self.enable_flag = False
         # 실측을 1회 이상 수신해 발행을 시작했는지(= ROS1 innfos position_set 가드 역할).
@@ -110,6 +124,9 @@ class NeroHardwareInterface(Node):
         self._was_drag = False
         # MIT 서보 목표(arm_joint_names 순서). _command_cb가 기록, 제어 타이머가 추종.
         self._last_cmd = None
+        # 자동 drag 가드 상태
+        self._dev_trip_since = None   # 편차 초과 시작 perf_counter 시각(진입 디바운스)
+        self._settle_hist = []        # [(t, q), ...] 탈출 settle 슬라이딩 윈도우
 
         self._init_arm()
         self._init_dynamics()
@@ -123,6 +140,7 @@ class NeroHardwareInterface(Node):
         )
         self.create_subscription(JointState, self.command_topic, self._command_cb, 1)
         self.create_service(SetBool, "drag_mode", self._drag_cb)
+        self.create_service(SetBool, "auto_drag_guard", self._auto_drag_guard_cb)
         self._switch_cli = self.create_client(
             SwitchController, f"{self.controller_manager_name}/switch_controller"
         )
@@ -197,11 +215,22 @@ class NeroHardwareInterface(Node):
         return self.arm_control_mode == "move_mit" and self._gc_ok
 
     def _on_set_params(self, params):
-        """런타임 파라미터 변경(rqt / ros2 param set). 현재 debug만 즉시 반영."""
+        """런타임 파라미터 변경(rqt / ros2 param set)."""
         for p in params:
             if p.name == "debug":
                 self.debug = bool(p.value)
-                self.get_logger().info(f"debug = {self.debug}")
+            elif p.name == "auto_drag_guard_enabled":
+                self.auto_drag_guard_on = bool(p.value)
+            elif p.name == "deviation_torque_threshold":
+                self.deviation_torque_threshold = max(0.0, float(p.value))
+            elif p.name == "deviation_window_sec":
+                self.deviation_window_sec = max(0.0, float(p.value))
+            elif p.name == "drag_auto_exit_enabled":
+                self.drag_auto_exit_on = bool(p.value)
+            elif p.name == "settle_window_sec":
+                self.settle_window_sec = max(0.1, float(p.value))
+            elif p.name == "settle_still_deg":
+                self.settle_still_deg = max(0.0, float(p.value))
         return SetParametersResult(successful=True)
 
     ### 제어 타이머: read → 계산 → 제어 송신(drag/정상 분기) → feedback 발행.
@@ -273,7 +302,10 @@ class NeroHardwareInterface(Node):
                         t_ff=float(self.gravity_scale[i] * tau[i]),
                     )
             self._was_drag = True
+            self._check_settle_exit(q)          # drag 중 정지 지속 시 자동 탈출(수동 진입 포함)
         else:
+            if self._check_deviation_entry(efforts, tau):
+                return                          # 자동 drag 진입함 → 이번 cycle 정상 송신 생략
             if self._was_drag:
                 # drag 막 해제: 현재 자세로 목표 고정(옛 명령으로 스냅 방지)
                 self._last_cmd = list(q)
@@ -407,26 +439,88 @@ class NeroHardwareInterface(Node):
                 response.message = "enable arm before drag"
                 self.get_logger().warn(response.message)
                 return response
-            # JTC 명령 전달 먼저 차단 → arm_controller 비활성화 → 중력보상 MIT 시작
-            self._block_forward = True
-            self._switch_controller(activate=[], deactivate=[self.arm_controller_name])
-            self.drag_mode_active = True
+            self._enter_drag("manual service")
             response.success = True
             response.message = "Drag(gravity-comp) on"
-            self.get_logger().info(response.message)
         else:
-            # MIT 중단(발행 스레드 falling-edge가 현재 자세 hold/서보 이어받음) → arm_controller 재활성화
-            self.drag_mode_active = False
-            fut = self._switch_controller(activate=[self.arm_controller_name], deactivate=[])
-            # 재활성화가 끝난 뒤에 전달 재개(전환 중 unclaimed 명령 인터페이스 stale 값 누출 방지)
-            if fut is not None:
-                fut.add_done_callback(lambda _f: self._unblock_forward())
-            else:
-                self._unblock_forward()   # 서비스 없으면 best-effort 즉시 해제
+            self._exit_drag("manual service")
             response.success = True
             response.message = "Drag(gravity-comp) off (normal control restored)"
-            self.get_logger().info(response.message)
         return response
+
+    def _auto_drag_guard_cb(self, request, response):
+        """자동 drag 진입 가드 on/off (런타임)."""
+        self.auto_drag_guard_on = bool(request.data)
+        if not self.auto_drag_guard_on:
+            self._dev_trip_since = None
+        response.success = True
+        response.message = f"Auto drag guard {'on' if self.auto_drag_guard_on else 'off'}"
+        self.get_logger().info(response.message)
+        return response
+
+    def _enter_drag(self, reason):
+        """drag(중력보상) 진입: 명령전달 차단 → arm_controller 비활성화(실행 중 JTC goal abort)
+        → 다음 cycle부터 중력보상 MIT. 수동/자동 공통."""
+        self._block_forward = True
+        self._switch_controller(activate=[], deactivate=[self.arm_controller_name])
+        self.drag_mode_active = True
+        self._dev_trip_since = None
+        self._settle_hist = []
+        self.get_logger().warn(f"Drag ENTER ({reason})")
+
+    def _exit_drag(self, reason):
+        """drag 탈출: arm_controller 재활성화(완료 시 전달 재개). loop falling-edge가 현재 자세 hold.
+        수동/자동(settle) 공통."""
+        self.drag_mode_active = False
+        self._settle_hist = []
+        fut = self._switch_controller(activate=[self.arm_controller_name], deactivate=[])
+        if fut is not None:
+            fut.add_done_callback(lambda _f: self._unblock_forward())
+        else:
+            self._unblock_forward()   # 서비스 없으면 best-effort 즉시 해제
+        self.get_logger().info(f"Drag EXIT ({reason})")
+
+    def _check_deviation_entry(self, efforts, tau):
+        """NORMAL: 측정토크 vs 중력모델 편차가 임계를 window초 지속하면 자동 drag 진입(True 반환)."""
+        if (not self.auto_drag_guard_on) or (not self.enable_flag) or tau is None:
+            self._dev_trip_since = None
+            return False
+        n = min(len(efforts), len(tau), self.arm_joint_count)
+        if n == 0:
+            self._dev_trip_since = None
+            return False
+        max_dev = max(abs(efforts[i] - self.gravity_scale[i] * tau[i]) for i in range(n))
+        now = time.perf_counter()
+        if max_dev > self.deviation_torque_threshold:
+            if self._dev_trip_since is None:
+                self._dev_trip_since = now
+            elif now - self._dev_trip_since >= self.deviation_window_sec:
+                self._enter_drag(
+                    f"torque deviation {max_dev:.2f} N.m > {self.deviation_torque_threshold:.2f}"
+                )
+                return True
+        else:
+            self._dev_trip_since = None
+        return False
+
+    def _check_settle_exit(self, q):
+        """DRAG: 자세가 settle_window초 동안 모든 관절 std < settle_still_deg면 자동 탈출.
+        진입 경로 무관(수동 drag도 자동 탈출)."""
+        if not self.drag_auto_exit_on:
+            return
+        now = time.perf_counter()
+        self._settle_hist.append((now, list(q)))
+        win = self.settle_window_sec
+        self._settle_hist = [(t, qq) for (t, qq) in self._settle_hist if now - t <= win]
+        if len(self._settle_hist) < 5 or (now - self._settle_hist[0][0]) < win * 0.95:
+            return
+        thr = math.radians(self.settle_still_deg)
+        stds = [
+            float(np.std([qq[i] for (_, qq) in self._settle_hist]))
+            for i in range(self.arm_joint_count)
+        ]
+        if all(s < thr for s in stds):
+            self._exit_drag(f"settled {win:.1f}s (< {self.settle_still_deg:.1f} deg)")
 
 
 def main(args=None):

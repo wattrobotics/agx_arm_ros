@@ -149,7 +149,7 @@ def generate_launch_description():
         DeclareLaunchArgument("can_port", default_value="can0"),
         DeclareLaunchArgument("auto_enable", default_value="true"),
         DeclareLaunchArgument("speed_percent", default_value="100"),
-        DeclareLaunchArgument("pub_rate", default_value="200"),
+        DeclareLaunchArgument("pub_rate", default_value="100"),
         DeclareLaunchArgument("enable_timeout", default_value="5.0"),
         # start_interface:=false 면 브리지(nero_hardware_interface)를 띄우지 않는다
         # (브리지를 nero_interface.launch.py 로 따로 띄울 때 사용).
