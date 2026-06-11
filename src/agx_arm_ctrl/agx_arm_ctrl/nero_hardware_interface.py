@@ -31,6 +31,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Int32
+from geometry_msgs.msg import WrenchStamped
 from builtin_interfaces.msg import Time
 from std_srvs.srv import SetBool
 from controller_manager_msgs.srv import SwitchController
@@ -70,6 +71,8 @@ class NeroHardwareInterface(Node):
             "urdf_path",
             "/home/yunbeom/agx_arm_ws/src/agx_arm_ros/src/agx_arm_description/agx_arm_urdf/nero/nero_handeye.urdf",
         )
+        # endeffector_force 추정용 EE 프레임(Pinocchio frame). 모델에 없으면 추정 비활성.
+        self.declare_parameter("ee_frame", "end_point_link")
         self.declare_parameter("controller_manager_name", "controller_manager")
         self.declare_parameter("arm_controller_name", "arm_controller")
         for j in range(1, 8):
@@ -109,6 +112,7 @@ class NeroHardwareInterface(Node):
         self.command_topic = self.get_parameter("command_topic").value
         self.feedback_topic = self.get_parameter("feedback_topic").value
         self.urdf_path = self.get_parameter("urdf_path").value
+        self.ee_frame = self.get_parameter("ee_frame").value
         self.controller_manager_name = self.get_parameter("controller_manager_name").value
         self.arm_controller_name = self.get_parameter("arm_controller_name").value
         self.gravity_scale = [self.get_parameter(f"gravity_scale_{j}").value for j in range(1, 8)]
@@ -152,6 +156,8 @@ class NeroHardwareInterface(Node):
         )
         # 디버깅/모니터링용: 현재 drag(중력보상) 모드 여부(0=일반, 1=drag). 매 제어 루프 발행.
         self.is_drag_mode_pub = self.create_publisher(Int32, "feedback/is_drag_mode", 1)
+        # endeffector_force: 관성가중 토크-잔차로 추정한 EE 힘(3D, EE 좌표). gc_ok+ee_frame 시 발행.
+        self.ee_force_pub = self.create_publisher(WrenchStamped, "feedback/endeffector_force", 1)
         self.create_subscription(JointState, self.command_topic, self._command_cb, 1)
         self.create_service(SetBool, "drag_mode", self._drag_cb)
         self.create_service(SetBool, "auto_drag_guard", self._auto_drag_guard_cb)
@@ -190,6 +196,7 @@ class NeroHardwareInterface(Node):
         """중력보상 모델(Pinocchio) 로드. 실패해도 노드는 정상 동작(MIT→move_js 폴백)."""
         self._gc_ok = False
         self.pin_model = None
+        self.ee_frame_id = None
         if not _HAS_PIN:
             self.get_logger().warn("pinocchio not available; gravity comp disabled")
             return
@@ -205,8 +212,45 @@ class NeroHardwareInterface(Node):
                 )
             self._gc_ok = True
             self.get_logger().info(f"Gravity model loaded (nv={self.pin_model.nv})")
+            self._resolve_ee_frame(self.ee_frame)
         except Exception as e:
             self.get_logger().error(f"gravity model load failed: {e}")
+
+    def _resolve_ee_frame(self, name):
+        """ee_frame 이름 → Pinocchio frame id 해석/검증. 모델에 없으면 추정 비활성."""
+        if not self._gc_ok:
+            self.ee_frame_id = None
+            return
+        if self.pin_model.existFrame(name):
+            self.ee_frame = name
+            self.ee_frame_id = self.pin_model.getFrameId(name)
+            self.get_logger().info(f"endeffector_force frame = '{name}'")
+        else:
+            self.ee_frame_id = None
+            self.get_logger().warn(f"ee_frame '{name}' not in model; endeffector_force disabled")
+
+    def _estimate_ee_force(self, q, efforts, tau):
+        """관성가중 토크-잔차로 EE 힘(3D, EE 좌표) 추정. 준정적 가정.
+        np.ndarray(3,) 반환; 불가/특이점이면 None. try/except·isfinite는 특이점
+        발산이 제어 루프(모터 명령)를 죽이지 않게 하는 예외 격리."""
+        if not (self._gc_ok and tau is not None and self.ee_frame_id is not None):
+            return None
+        try:
+            qnp = np.asarray(q, dtype=float)
+            J = pin.computeFrameJacobian(self.pin_model, self.pin_data, qnp,
+                                         self.ee_frame_id, pin.ReferenceFrame.LOCAL)
+            Jv = J[:3, :]                                   # 3×7 선형(EE 좌표)
+            pin.crba(self.pin_model, self.pin_data, qnp)    # data.M (상삼각만 채움)
+            M = np.triu(self.pin_data.M)
+            M = M + M.T - np.diag(np.diag(M))               # 대칭화 (crba gotcha)
+            Minv = np.linalg.inv(M)
+            J_bar = Minv @ Jv.T @ np.linalg.inv(Jv @ Minv @ Jv.T)   # 7×3, 관성가중
+            F = J_bar.T @ (np.asarray(efforts) - np.asarray(tau))   # 측정 − 중력 → 3D 힘
+        except np.linalg.LinAlgError:
+            return None                                     # 정확 특이 → 그 사이클 발행만 스킵
+        if not np.all(np.isfinite(F)):
+            return None                                     # 근처 특이 inf/nan → 스킵
+        return F
 
     def _enable_arm(self, enable=True):
         start = time.time()
@@ -311,6 +355,18 @@ class NeroHardwareInterface(Node):
                 self.pin_model, self.pin_data, np.asarray(q, dtype=float)
             )
         t_grav = clk()
+
+        # endeffector_force: 관성가중 토크-잔차로 추정한 EE 힘(EE 좌표). 특이점/모델없음 시 스킵.
+        if tau is not None and self.ee_frame_id is not None:
+            F_ee = self._estimate_ee_force(q, efforts, tau)
+            if F_ee is not None:
+                w = WrenchStamped()
+                w.header.stamp = msg.header.stamp
+                w.header.frame_id = self.ee_frame
+                w.wrench.force.x = float(F_ee[0])
+                w.wrench.force.y = float(F_ee[1])
+                w.wrench.force.z = float(F_ee[2])
+                self.ee_force_pub.publish(w)
 
         # 4. 제어 송신 (drag / 정상 분기)
         n = self.arm_joint_count
