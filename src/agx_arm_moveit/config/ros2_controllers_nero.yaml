@@ -4,12 +4,34 @@ controller_manager:
 
     arm_controller:
       type: joint_trajectory_controller/JointTrajectoryController
+    servo_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
     joint_state_broadcaster:
       type: joint_state_broadcaster/JointStateBroadcaster
 
 arm_controller:
   ros__parameters:
     allow_nonzero_velocity_at_trajectory_end: false
+    joints:
+      - joint1
+      - joint2
+      - joint3
+      - joint4
+      - joint5
+      - joint6
+      - joint7
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+
+servo_controller:
+  ros__parameters:
+    # Servo는 연속 스트리밍이라 매 trajectory 마지막 점에 0이 아닌 속도가 들어있다.
+    # false면 JTC가 그 명령을 거부("Velocity of last trajectory point ... not zero")해
+    # 이동 중 안 움직이다가 stop 시 확 점프한다 → Servo용 JTC는 반드시 true.
+    allow_nonzero_velocity_at_trajectory_end: true
     joints:
       - joint1
       - joint2

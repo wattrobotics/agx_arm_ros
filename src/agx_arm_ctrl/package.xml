@@ -16,6 +16,8 @@
   <depend>builtin_interfaces</depend>
   <depend>controller_manager_msgs</depend>
   <depend>agx_arm_msgs</depend>
+  <!-- servo_teleop 노드의 switch_command_type(ServoCommandType) 호출용 -->
+  <exec_depend>moveit_msgs</exec_depend>
   <depend>launch</depend>
   <depend>launch_ros</depend>
   <depend>ament_index_python</depend>

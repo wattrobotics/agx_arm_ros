@@ -88,6 +88,13 @@ class NeroHardwareInterface(Node):
         self.declare_parameter("drag_auto_exit_enabled", True)
         self.declare_parameter("settle_window_sec", 3.0)
         self.declare_parameter("settle_still_deg", 5.0)
+        # drag 탈출 시 MoveIt Servo 재동기화. servo는 명령이 없을 때 측정값을 추종하지 않고
+        # last_commanded_state_(마지막 명령 자세)를 유지하므로, drag로 손으로 옮기면 servo 내부
+        # 상태가 옛 자세에 고정된다 → servo로 복귀 시 옛 자세로 점프. drag 탈출 때 pause_servo(false)
+        # 를 호출하면 servo가 현재 자세로 재동기화한다. servo_node 미실행이면 자동 skip(블록 안 함).
+        self.declare_parameter("servo_resync_on_drag", True)
+        self.declare_parameter("servo_pause_service", "/servo_node/pause_servo")
+        self.declare_parameter("servo_resume_settle_sec", 0.25)
 
         self.can_port = self.get_parameter("can_port").value
         self.arm_type = self.get_parameter("arm_type").value
@@ -113,6 +120,9 @@ class NeroHardwareInterface(Node):
         self.drag_auto_exit_on = self.get_parameter("drag_auto_exit_enabled").value
         self.settle_window_sec = self.get_parameter("settle_window_sec").value
         self.settle_still_deg = self.get_parameter("settle_still_deg").value
+        self.servo_resync_on_drag = self.get_parameter("servo_resync_on_drag").value
+        self.servo_pause_service = self.get_parameter("servo_pause_service").value
+        self.servo_resume_settle_sec = self.get_parameter("servo_resume_settle_sec").value
 
         self.enable_flag = False
         # 실측을 1회 이상 수신해 발행을 시작했는지(= ROS1 innfos position_set 가드 역할).
@@ -127,6 +137,7 @@ class NeroHardwareInterface(Node):
         # 자동 drag 가드 상태
         self._dev_trip_since = None   # 편차 초과 시작 perf_counter 시각(진입 디바운스)
         self._settle_hist = []        # [(t, q), ...] 탈출 settle 슬라이딩 윈도우
+        self._unblock_at = None       # drag 탈출 후 command 전달 재개 deadline(perf_counter)
 
         self._init_arm()
         self._init_dynamics()
@@ -144,6 +155,8 @@ class NeroHardwareInterface(Node):
         self._switch_cli = self.create_client(
             SwitchController, f"{self.controller_manager_name}/switch_controller"
         )
+        # MoveIt Servo pause/resume 클라이언트. servo_node 미실행 시 호출 skip(블록 안 함).
+        self._pause_cli = self.create_client(SetBool, self.servo_pause_service)
 
         # 제어 루프 = ROS 타이머. 블로킹 CAN(read/move_*)이 콜백(command/drag)을 막지 않도록
         # 전용 MutuallyExclusiveCallbackGroup에 두고 MultiThreadedExecutor로 돌린다(main 참고).
@@ -245,6 +258,10 @@ class NeroHardwareInterface(Node):
     def _control_once(self):
         clk = time.perf_counter
         t0 = clk()
+        # drag 탈출 후 예약된 command 전달 재개(servo 재동기화 settle). sleep 없이 루프에서 처리.
+        if self._unblock_at is not None and t0 >= self._unblock_at:
+            self._unblock_at = None
+            self._unblock_forward()
         if not self.agx_arm.is_ok():
             return
         js = self.agx_arm.get_joint_angles()
@@ -423,6 +440,19 @@ class NeroHardwareInterface(Node):
         req.strictness = SwitchController.Request.BEST_EFFORT
         return self._switch_cli.call_async(req)
 
+    def _set_servo_paused(self, paused):
+        """MoveIt Servo의 pause_servo 토글(비블로킹). servo_node 미실행/미발견이면 skip(블록 안 함).
+        unpause(false) 시 servo가 last_commanded_state_를 현재 자세로 리셋 → drag 후 점프 방지.
+        service_is_ready 가드 + call_async라 servo를 안 쓰는 구성에서 절대 블록되지 않는다."""
+        if not self.servo_resync_on_drag:
+            return False
+        if not self._pause_cli.service_is_ready():
+            return False                      # servo 미실행/미발견 → skip
+        req = SetBool.Request()
+        req.data = bool(paused)
+        self._pause_cli.call_async(req)       # 응답 대기 안 함
+        return True
+
     def _unblock_forward(self):
         self._block_forward = False
         self.get_logger().info("Drag off: command forwarding resumed")
@@ -460,24 +490,30 @@ class NeroHardwareInterface(Node):
 
     def _enter_drag(self, reason):
         """drag(중력보상) 진입: 명령전달 차단 → arm_controller 비활성화(실행 중 JTC goal abort)
-        → 다음 cycle부터 중력보상 MIT. 수동/자동 공통."""
+        → servo pause(있으면, 재동기화 준비) → 다음 cycle부터 중력보상 MIT. 수동/자동 공통."""
         self._block_forward = True
+        self._unblock_at = None                # 진행 중이던 unblock 예약 취소
         self._switch_controller(activate=[], deactivate=[self.arm_controller_name])
+        servo = self._set_servo_paused(True)   # servo 발행 중지(있으면)
         self.drag_mode_active = True
         self._dev_trip_since = None
         self._settle_hist = []
-        self.get_logger().warn(f"Drag ENTER ({reason})")
+        self.get_logger().warn(
+            f"Drag ENTER ({reason})" + (" [servo paused]" if servo else "")
+        )
 
     def _exit_drag(self, reason):
-        """drag 탈출: arm_controller 재활성화(완료 시 전달 재개). loop falling-edge가 현재 자세 hold.
-        수동/자동(settle) 공통."""
+        """drag 탈출: servo unpause(현재 자세로 재동기화) → arm_controller 재활성화(servo 모드면
+        servo_controller가 인터페이스를 잡고 있어 BEST_EFFORT로 무시 = servo_controller 유지) →
+        command 전달 재개를 settle 시간만큼 지연. 지연 동안 loop falling-edge가 잡은 현재 자세
+        (_last_cmd)를 hold하므로, servo/컨트롤러가 재동기화된 명령(현재 자세)을 command interface에
+        반영한 뒤 전달이 재개되어 옛 자세로의 점프를 막는다. 수동/자동(settle) 공통.
+        sleep 없이 _control_once의 deadline로 처리해 제어 루프를 막지 않는다."""
         self.drag_mode_active = False
         self._settle_hist = []
-        fut = self._switch_controller(activate=[self.arm_controller_name], deactivate=[])
-        if fut is not None:
-            fut.add_done_callback(lambda _f: self._unblock_forward())
-        else:
-            self._unblock_forward()   # 서비스 없으면 best-effort 즉시 해제
+        self._set_servo_paused(False)          # servo 재동기화(unpause); 없으면 skip
+        self._switch_controller(activate=[self.arm_controller_name], deactivate=[])
+        self._unblock_at = time.perf_counter() + max(0.0, self.servo_resume_settle_sec)
         self.get_logger().info(f"Drag EXIT ({reason})")
 
     def _check_deviation_entry(self, efforts, tau):

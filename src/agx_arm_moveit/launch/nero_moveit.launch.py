@@ -21,7 +21,9 @@ from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node, PushRosNamespace, SetRemap
+from launch_param_builder import ParameterBuilder
 from moveit_configs_utils.launch_utils import DeclareBooleanLaunchArg
+from ament_index_python.packages import get_package_share_directory
 
 from _moveit_config_builder import build_moveit_config
 
@@ -71,14 +73,14 @@ def _build(context):
             executable="nero_hardware_interface",
             name="nero_hardware_interface",
             output="screen",
-            parameters=[{
-                "can_port": LaunchConfiguration("can_port"),
-                "arm_type": LaunchConfiguration("arm_type"),
-                "auto_enable": LaunchConfiguration("auto_enable"),
-                "speed_percent": LaunchConfiguration("speed_percent"),
-                "pub_rate": LaunchConfiguration("pub_rate"),
-                "enable_timeout": LaunchConfiguration("enable_timeout"),
-            }],
+            parameters=[
+                LaunchConfiguration("params_file"),          # 튜닝(YAML)
+                {                                            # 환경/구조만
+                    "can_port": LaunchConfiguration("can_port"),
+                    "arm_type": LaunchConfiguration("arm_type"),
+                    "auto_enable": LaunchConfiguration("auto_enable"),
+                },
+            ],
             condition=IfCondition(LaunchConfiguration("start_interface")),
         )
     )
@@ -122,6 +124,46 @@ def _build(context):
         )
     )
 
+    # --- MoveIt Servo (use_servo:=true 일 때만) ---
+    # servo_controller 는 arm_controller 와 같은 position 인터페이스를 claim 하므로 동시 active
+    # 불가 → --inactive 로 로드만 한다. 활성화/비활성화는 외부에서 switch_controller 로 수행.
+    actions.append(
+        Node(
+            package="controller_manager",
+            executable="spawner",
+            arguments=[
+                "servo_controller", "--inactive",
+                "--controller-manager", "controller_manager",
+            ],
+            output="screen",
+            condition=IfCondition(LaunchConfiguration("use_servo")),
+        )
+    )
+    # servo_node: arm 그룹 twist/jointjog 를 servo_controller(JTC) 토픽으로 스트리밍.
+    servo_params = {
+        "moveit_servo": ParameterBuilder("agx_arm_moveit")
+        .yaml("config/servo_nero.yaml")
+        .to_dict()
+    }
+    actions.append(
+        Node(
+            package="moveit_servo",
+            executable="servo_node",
+            name="servo_node",
+            output="screen",
+            parameters=[
+                servo_params,
+                {"update_period": 0.01},         # AccelerationLimited 필터용
+                {"planning_group_name": "arm"},  # AccelerationLimited 필터용
+                moveit_config.robot_description,
+                moveit_config.robot_description_semantic,
+                moveit_config.robot_description_kinematics,
+                moveit_config.joint_limits,
+            ],
+            condition=IfCondition(LaunchConfiguration("use_servo")),
+        )
+    )
+
     return [
         GroupAction(
             actions=[
@@ -148,12 +190,20 @@ def generate_launch_description():
         # 브리지(nero_hardware_interface) 파라미터
         DeclareLaunchArgument("can_port", default_value="can0"),
         DeclareLaunchArgument("auto_enable", default_value="true"),
-        DeclareLaunchArgument("speed_percent", default_value="100"),
-        DeclareLaunchArgument("pub_rate", default_value="100"),
-        DeclareLaunchArgument("enable_timeout", default_value="5.0"),
+        # 게인/가드/제어 튜닝은 yaml로 관리(커스텀 yaml로 교체 가능)
+        DeclareLaunchArgument(
+            "params_file",
+            default_value=os.path.join(
+                get_package_share_directory("agx_arm_ctrl"),
+                "config", "nero_hardware_interface.yaml",
+            ),
+        ),
         # start_interface:=false 면 브리지(nero_hardware_interface)를 띄우지 않는다
         # (브리지를 nero_interface.launch.py 로 따로 띄울 때 사용).
         DeclareLaunchArgument("start_interface", default_value="true"),
         DeclareBooleanLaunchArg("use_rviz", default_value=True),
+        # use_servo:=true 면 servo_node + servo_controller(--inactive)를 함께 띄운다.
+        # (모드 전환 switch_controller 는 사용자가 직접 수행)
+        DeclareBooleanLaunchArg("use_servo", default_value=False),
         OpaqueFunction(function=_build),
     ])

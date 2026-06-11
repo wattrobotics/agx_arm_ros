@@ -1,0 +1,49 @@
+# MoveIt Servo - Nero(+handeye) 실시간 teleop 설정
+# move_group "arm" = base_link -> end_point_link, 관절 joint1~joint7
+# 출력은 servo_controller(JTC)로, 활성화/비활성화는 외부에서 switch_controller로 제어한다.
+publish_period: 0.01            # 100 Hz (controller_manager update_rate와 동일)
+max_expected_latency: 0.1
+incoming_command_timeout: 0.1   # 입력이 끊기면 0.1s 후 자동 정지(안전)
+
+# command_in_type: "unitless"     # 조이스틱식 -1~1 / "speed_units"면 m/s·rad/s
+command_in_type: "speed_units"
+scale:
+  linear: 0.2
+  rotational: 0.6
+  joint: 0.5
+
+# --- 출력 -> servo_controller(JTC) ---
+command_out_type: trajectory_msgs/JointTrajectory
+command_out_topic: /servo_controller/joint_trajectory
+publish_joint_positions: true
+publish_joint_velocities: true
+publish_joint_accelerations: false
+
+# --- move_group이 primary planning scene이므로 servo는 보조 ---
+is_primary_planning_scene_monitor: false
+monitored_planning_scene_topic: /planning_scene
+joint_topic: /joint_states
+check_octomap_collisions: false
+
+move_group_name: arm
+
+cartesian_command_in_topic: ~/delta_twist_cmds
+joint_command_in_topic: ~/delta_joint_cmds
+pose_command_in_topic: ~/pose_target_cmds
+status_topic: ~/status
+
+# --- 충돌 / 특이점 (기본값) ---
+check_collisions: false
+collision_check_rate: 10.0
+self_collision_proximity_threshold: 0.005
+scene_collision_proximity_threshold: 0.01
+lower_singularity_threshold: 30.0
+hard_stop_singularity_threshold: 40.0
+leaving_singularity_threshold_multiplier: 3.0
+joint_limit_margins: [0.05]
+
+# --- 스무딩 (가속 한계 존중; joint_limits.yaml의 accel 한계 사용) ---
+# AccelerationLimitedPlugin 이슈 시 online_signal_smoothing::ButterworthFilterPlugin 로 폴백
+# (그 경우 launch의 update_period / planning_group_name 파라미터는 불필요).
+use_smoothing: true
+smoothing_filter_plugin_name: "online_signal_smoothing::AccelerationLimitedPlugin"
