@@ -177,6 +177,44 @@ class AgxArmTeleopWithMovePNode(Node):
                 floating_point_range=[FloatingPointRange(from_value=0.0, to_value=0.1, step=0.0)],
             ),
         )
+        # force_control(힘제어 유지) 서비스: tool -z로 force_des[N]를 feedforward로 눌러 유지하고
+        # 나머지 축은 위치/자세를 잡는다. move_mit 토크(kp=0, 모터측 kd 감쇠)로 송신.
+        # 감쇠는 gravity_kd_j(모터측), 중력보상은 gravity_scale_j 재사용.
+        self.declare_parameter(
+            "force_des", 5.0,
+            ParameterDescriptor(
+                description="force_control 목표 누름힘(N, tool -z, feedforward)",
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=30.0, step=0.0)],
+            ),
+        )
+        self.declare_parameter(
+            "force_max_distance", 0.05,
+            ParameterDescriptor(
+                description="force_control 안전 최대 전진거리(m, 무접촉 폭주 차단)",
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=0.3, step=0.0)],
+            ),
+        )
+        self.declare_parameter(
+            "force_kp_lin", 200.0,
+            ParameterDescriptor(
+                description="force_control 위치유지 강성(N/m, 힘축 제외). 50Hz라 보수적으로",
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=2000.0, step=0.0)],
+            ),
+        )
+        self.declare_parameter(
+            "force_kp_rot", 5.0,
+            ParameterDescriptor(
+                description="force_control 자세유지 강성(N·m/rad)",
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=50.0, step=0.0)],
+            ),
+        )
+        self.declare_parameter(
+            "force_ramp_time", 1.0,
+            ParameterDescriptor(
+                description="force_des 0→목표 무충격 램프 시간(s)",
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=10.0, step=0.0)],
+            ),
+        )
         self.can_port = self.get_parameter("can_port").value
         self.arm_type = self.get_parameter("arm_type").value
         self.auto_enable = self.get_parameter("auto_enable").value
@@ -194,6 +232,11 @@ class AgxArmTeleopWithMovePNode(Node):
         self.probe_max_distance = self.get_parameter("probe_max_distance").value
         self.probe2_speed_max = self.get_parameter("probe2_speed_max").value
         self.probe2_speed_min = self.get_parameter("probe2_speed_min").value
+        self.force_des = self.get_parameter("force_des").value
+        self.force_max_distance = self.get_parameter("force_max_distance").value
+        self.force_kp_lin = self.get_parameter("force_kp_lin").value
+        self.force_kp_rot = self.get_parameter("force_kp_rot").value
+        self.force_ramp_time = self.get_parameter("force_ramp_time").value
 
         self.enable_flag = False
         self.control_ready = False
@@ -208,6 +251,10 @@ class AgxArmTeleopWithMovePNode(Node):
         self.probe_start_target = None
         self.probe_result = None     # (success, message)
         self._probe_consec = 0
+        # force_control 상태
+        self.force_active = False
+        self.force_entry_pose = None   # (R_des, p_des) 진입 첫 사이클에 현재 pose로 캡처
+        self.force_entry_t = 0.0       # force_des 램프 기준 시각(perf_counter)
 
         self._init_arm()
         self._init_dynamics()
@@ -223,6 +270,7 @@ class AgxArmTeleopWithMovePNode(Node):
         self.create_service(SetBool, "drag_mode", self._drag_cb)
         self.create_service(Trigger, "probe_z", self._probe_cb)
         self.create_service(Trigger, "probe_z2", self._probe2_cb)
+        self.create_service(SetBool, "force_control", self._force_cb)
         self.add_on_set_parameters_callback(self._on_set_params)
 
         # 모든 CAN I/O(읽기+move_p)는 이 한 스레드에서만 → 레이스 방지
@@ -481,6 +529,11 @@ class AgxArmTeleopWithMovePNode(Node):
             self._drag_once(q)
             return
 
+        # force_control(힘제어 유지): move_p 대신 move_mit 토크(중력 + 작업렌치)
+        if self.force_active and self._gc_ok and self.ee_frame_id is not None:
+            self._force_servo(q)
+            return
+
         # target 최초/드래그 해제 후 시드: 현재 flange pose
         if self.target is None:
             seed = self._read_flange_pose()
@@ -508,6 +561,65 @@ class AgxArmTeleopWithMovePNode(Node):
                 kp=0.0, kd=self.gravity_kd[i],
                 t_ff=float(self.gravity_scale[i] * tau[i]),
             )
+
+    def _force_servo(self, q):
+        """tool -z로 force_des[N]를 feedforward로 눌러 유지 + 나머지 축 위치/자세 유지.
+        move_mit 토크(kp=0, 모터측 kd 감쇠)로 송신. 루프 스레드 전용.
+
+        설계 메모 (V111 / 50Hz 제약):
+        - 힘 피드백 없음: 토크모드에선 토크-잔차 힘추정이 자기 명령을 되읽으므로(평형에서
+          측정토크=명령토크) feedforward로 누른다. 표면 반작용이 force_des와 평형 → 접촉력=force_des.
+          무충격 위해 force_des는 smoothstep 램프.
+        - 호스트 속도 피드백 없음(V111 get_motor_states velocity=0): 모든 감쇠는 move_mit kd(모터측).
+        - 위치/자세 유지는 호스트 강성(P항)만. 힘 축 성분은 제거해 위치-힘 충돌 방지.
+        - push 방향·자세 기준은 ee_frame(=force 추정 프레임)으로 통일.
+        """
+        qn = np.asarray(q, dtype=float)
+        G = pin.computeGeneralizedGravity(self.pin_model, self.pin_data, qn)
+        pin.framesForwardKinematics(self.pin_model, self.pin_data, qn)
+        oMf = self.pin_data.oMf[self.ee_frame_id]
+        R, p = np.array(oMf.rotation), np.array(oMf.translation)
+
+        # 진입 첫 사이클: 현재 pose를 기준으로 캡처(오차 0 출발) + 램프 기준 시각
+        if self.force_entry_pose is None:
+            self.force_entry_pose = (R.copy(), p.copy())
+            self.force_entry_t = time.perf_counter()
+            self.get_logger().info("force_control: entry pose captured, ramping 0 -> force_des")
+        R_des, p_des = self.force_entry_pose
+
+        # force_des 무충격 램프 (smoothstep: 0속도 시단/종단)
+        frac = max(0.0, min(1.0, (time.perf_counter() - self.force_entry_t)
+                            / max(1e-3, self.force_ramp_time)))
+        f_now = self.force_des * (3.0 * frac * frac - 2.0 * frac ** 3)
+
+        # LOCAL_WORLD_ALIGNED: twist/wrench를 EE점·월드축으로 → 위치/자세 오차와 정합
+        J = pin.computeFrameJacobian(self.pin_model, self.pin_data, qn,
+                                     self.ee_frame_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
+        push = -(R @ np.array([0.0, 0.0, 1.0]))            # tool -z (base) = 누름/전진 방향
+
+        F_lin = self.force_kp_lin * (p_des - p)            # 위치 유지(호스트 속도항 없음)
+        F_lin = F_lin - float(np.dot(F_lin, push)) * push  # 힘 축 성분 제거(위치-힘 충돌 방지)
+        F_lin = F_lin + push * f_now                       # feedforward 누름힘(램프)
+        M_rot = self.force_kp_rot * _Rot.from_matrix(R_des @ R.T).as_rotvec()  # 자세 유지(base)
+
+        wrench = np.concatenate([F_lin, M_rot])            # 6D, base/LWA
+        g_scaled = np.array([self.gravity_scale[i] * G[i] for i in range(self.arm_joint_count)])
+        tau = np.clip(g_scaled + J.T @ wrench, -16.0, 16.0)  # ±16 N·m = t_ff 12-bit 인코딩 한계
+
+        for i in range(self.arm_joint_count):
+            self.agx_arm.move_mit(
+                joint_index=i + 1, p_des=0.0, v_des=0.0,
+                kp=0.0, kd=self.gravity_kd[i], t_ff=float(tau[i]),   # kd = 모터측 감쇠
+            )
+
+        # 안전: 기준에서 누름축으로 force_max_distance 초과 전진(무접촉 폭주) 시 정지
+        if float(np.dot(p - p_des, push)) > self.force_max_distance:
+            self.get_logger().warn(
+                f"force_control: travel > {self.force_max_distance:.3f}m (no contact?) -> stop"
+            )
+            self.force_active = False
+            self.force_entry_pose = None
+            self.target = None                              # move_p 복귀(현재 pose 재시드)
 
     ### endeffector force estimation
     def _resolve_ee_frame(self, name):
@@ -582,8 +694,8 @@ class AgxArmTeleopWithMovePNode(Node):
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
     def _handle_key(self, ch):
-        if self.target is None or self.probe_active:
-            return                              # 미시드 / probe 동작 중 → teleop 차단
+        if self.target is None or self.probe_active or self.force_active:
+            return                              # 미시드 / probe·force 동작 중 → teleop 차단
         if ch in JOG_KEYS:
             axis, sign = JOG_KEYS[ch]
             if self.T_ft is None:
@@ -636,11 +748,47 @@ class AgxArmTeleopWithMovePNode(Node):
             response.message = "probe in progress; cannot enter drag"
             self.get_logger().warn(response.message)
             return response
+        if request.data and self.force_active:
+            response.success = False
+            response.message = "force_control active; cannot enter drag"
+            self.get_logger().warn(response.message)
+            return response
         self.drag_mode_active = bool(request.data)
         if not self.drag_mode_active:
             self.target = None          # 해제: 현재 flange pose로 재시드 후 move_p 복귀
         response.success = True
         response.message = f"Drag(gravity-comp) {'on' if request.data else 'off'}"
+        self.get_logger().info(response.message)
+        return response
+
+    def _force_cb(self, request, response):
+        """force_control 유지 모드 on/off (SetBool, 비블로킹).
+        on이면 _loop_once가 move_p 대신 move_mit 토크(중력 + 작업렌치)로 tool -z를 force_des로 누름.
+        진입 사전조건: enable + 중력모델 + ee_frame, drag/probe와 배타.
+        off면 현재 flange pose로 재시드해 move_p 복귀."""
+        if request.data:
+            if not self.enable_flag:
+                response.success, response.message = False, "enable arm before force_control"
+                self.get_logger().warn(response.message)
+                return response
+            if not (self._gc_ok and self.ee_frame_id is not None):
+                response.success, response.message = False, "force model/frame not ready"
+                self.get_logger().warn(response.message)
+                return response
+            if self.drag_mode_active or self.probe_active:
+                response.success, response.message = (
+                    False, "drag/probe active; cannot enter force_control")
+                self.get_logger().warn(response.message)
+                return response
+            self.force_entry_pose = None        # 루프 첫 사이클에서 현재 pose로 캡처
+            self.force_active = True            # ★ 마지막에 set (루프 스레드 인계)
+        else:
+            self.force_active = False
+            self.force_entry_pose = None
+            self.target = None                  # 해제: 현재 flange pose로 재시드 → move_p 복귀
+        response.success = True
+        response.message = (f"Force-hold on (force_des={self.force_des:.1f}N)"
+                            if request.data else "Force-hold off")
         self.get_logger().info(response.message)
         return response
 
@@ -665,6 +813,9 @@ class AgxArmTeleopWithMovePNode(Node):
             return response
         if self.drag_mode_active:
             response.success, response.message = False, "disable drag before probe"
+            return response
+        if self.force_active:
+            response.success, response.message = False, "disable force_control before probe"
             return response
         if self.probe_active:
             response.success, response.message = False, "probe already running"
@@ -706,6 +857,9 @@ class AgxArmTeleopWithMovePNode(Node):
             f"drag={self.drag_mode_active}  gc_ok={self._gc_ok}"
             + "  scale=[" + ",".join(f"{s:.2f}" for s in self.gravity_scale) + "]"
             + "  kd=[" + ",".join(f"{k:.2f}" for k in self.gravity_kd) + "]",
+            f"force={self.force_active}  force_des={self.force_des:.1f}N  "
+            f"kp_lin={self.force_kp_lin:.0f}  kp_rot={self.force_kp_rot:.1f}  "
+            f"max_dist={self.force_max_distance:.3f}m  ramp={self.force_ramp_time:.1f}s",
         ]
         if self.target is not None:
             lines.append("target    =[" + ", ".join(f"{v:+.3f}" for v in self.target) + "]")
@@ -769,6 +923,16 @@ class AgxArmTeleopWithMovePNode(Node):
                 self.probe2_speed_max = max(0.0, float(p.value))
             elif p.name == "probe2_speed_min":
                 self.probe2_speed_min = max(0.0, float(p.value))
+            elif p.name == "force_des":
+                self.force_des = max(0.0, float(p.value))
+            elif p.name == "force_max_distance":
+                self.force_max_distance = max(0.0, float(p.value))
+            elif p.name == "force_kp_lin":
+                self.force_kp_lin = max(0.0, float(p.value))
+            elif p.name == "force_kp_rot":
+                self.force_kp_rot = max(0.0, float(p.value))
+            elif p.name == "force_ramp_time":
+                self.force_ramp_time = max(0.0, float(p.value))
             elif p.name.startswith("gravity_scale_"):
                 idx = int(p.name.rsplit("_", 1)[1]) - 1
                 if 0 <= idx < len(self.gravity_scale):
