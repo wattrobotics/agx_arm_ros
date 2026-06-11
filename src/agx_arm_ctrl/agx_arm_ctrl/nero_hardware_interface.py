@@ -30,6 +30,7 @@ from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from sensor_msgs.msg import JointState
+from std_msgs.msg import Int32
 from builtin_interfaces.msg import Time
 from std_srvs.srv import SetBool
 from controller_manager_msgs.srv import SwitchController
@@ -149,6 +150,8 @@ class NeroHardwareInterface(Node):
         self.joint_drive_states_pub = self.create_publisher(
             JointDriveStateArray, "feedback/joint_drive_states", 1
         )
+        # 디버깅/모니터링용: 현재 drag(중력보상) 모드 여부(0=일반, 1=drag). 매 제어 루프 발행.
+        self.is_drag_mode_pub = self.create_publisher(Int32, "feedback/is_drag_mode", 1)
         self.create_subscription(JointState, self.command_topic, self._command_cb, 1)
         self.create_service(SetBool, "drag_mode", self._drag_cb)
         self.create_service(SetBool, "auto_drag_guard", self._auto_drag_guard_cb)
@@ -297,6 +300,8 @@ class NeroHardwareInterface(Node):
         self.joint_states_pub.publish(msg)
         self.joint_drive_states_pub.publish(drive_msg)
         self._publish_arm_status()
+        # drag 여부는 arm_status(None 시 발행 skip)와 독립적으로 매 루프 발행
+        self.is_drag_mode_pub.publish(Int32(data=1 if self.drag_mode_active else 0))
         t_pub = clk()
 
         # 3. 중력토크 G(q): drag/서보 양쪽 t_ff로 사용.
