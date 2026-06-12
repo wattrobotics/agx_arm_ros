@@ -265,25 +265,38 @@ class NeroHardwareInterface(Node):
             self.ee_frame_id = None
             self.get_logger().warn(f"ee_frame '{name}' not in model; endeffector_force disabled")
 
-    def _estimate_ee_force(self, q, efforts, tau):
-        """관성가중 토크-잔차로 EE 힘(3D, EE 좌표) 추정. 준정적 가정.
-        np.ndarray(3,) 반환; 불가/특이점이면 None. try/except·isfinite는 특이점
-        발산이 제어 루프(모터 명령)를 죽이지 않게 하는 예외 격리."""
-        if not (self._gc_ok and tau is not None and self.ee_frame_id is not None):
-            return None
+    def _ee_inertia_kinematics(self, q):
+        """EE 자코비안 선형부 Jv(3×n)와 관성행렬 역행렬 Minv를 1회 계산해 (Jv, Minv) 반환.
+        raw·filtered EE 힘 추정이 공유 → 사이클당 computeFrameJacobian/crba/inv(M) 중복 제거.
+        try/except는 특이점 발산이 제어 루프(모터 명령)를 죽이지 않게 하는 예외 격리. 특이면 None."""
         try:
             qnp = np.asarray(q, dtype=float)
             J = pin.computeFrameJacobian(self.pin_model, self.pin_data, qnp,
                                          self.ee_frame_id, pin.ReferenceFrame.LOCAL)
-            Jv = J[:3, :]                                   # 3×7 선형(EE 좌표)
+            Jv = J[:3, :]                                   # 3×n 선형(EE 좌표)
             pin.crba(self.pin_model, self.pin_data, qnp)    # data.M (상삼각만 채움)
             M = np.triu(self.pin_data.M)
             M = M + M.T - np.diag(np.diag(M))               # 대칭화 (crba gotcha)
-            Minv = np.linalg.inv(M)
-            J_bar = Minv @ Jv.T @ np.linalg.inv(Jv @ Minv @ Jv.T)   # 7×3, 관성가중
-            F = J_bar.T @ (np.asarray(efforts) - np.asarray(tau))   # 측정 − 중력 → 3D 힘
+            return Jv, np.linalg.inv(M)
         except np.linalg.LinAlgError:
             return None                                     # 정확 특이 → 그 사이클 발행만 스킵
+
+    def _map_residual_to_force(self, kin, residual, damping):
+        """관절토크 잔차 → EE 힘(3D, EE 좌표)을 관성가중 의사역으로 매핑(준정적 가정).
+        kin=(Jv, Minv) 공유 입력(None이면 스킵). damping>0이면 damped LS(특이점 노이즈 증폭 억제),
+        damping=0이면 비감쇠(raw용)로 기존 inv(Jv·Minv·Jvᵀ)와 동일. LinAlgError·isfinite 격리는
+        근처 특이점 inf/nan이 제어 루프를 죽이지 않게 함. 불가/특이점이면 None(그 사이클 발행만 스킵)."""
+        if kin is None:
+            return None
+        Jv, Minv = kin
+        try:
+            A = Jv @ Minv @ Jv.T
+            if damping:
+                A = A + (damping ** 2) * np.eye(3)          # damped LS
+            J_bar = Minv @ Jv.T @ np.linalg.inv(A)          # n×3, 관성가중
+            F = J_bar.T @ np.asarray(residual)
+        except np.linalg.LinAlgError:
+            return None
         if not np.all(np.isfinite(F)):
             return None                                     # 근처 특이 inf/nan → 스킵
         return F
@@ -297,40 +310,19 @@ class NeroHardwareInterface(Node):
         tau_c = 1.0 / (2.0 * math.pi * fc)
         return dt / (tau_c + dt)
 
-    def _estimate_ee_force_filtered(self, q, efforts, tau):
-        """raw 추정에 Tier1 필터 적용: 관절토크 잔차 − tare → EMA 저역통과 →
-        damped 관성가중 의사역으로 EE 힘(3D, EE 좌표) 매핑. None이면 그 사이클 스킵.
-        EMA 상태(_res_filt)는 매핑이 특이점으로 실패해도 갱신해 필터 연속성을 유지한다."""
-        if not (self._gc_ok and tau is not None and self.ee_frame_id is not None):
-            return None
-        # 1) 관절토크 잔차(측정 − 중력) − tare 오프셋
+    def _update_force_filter(self, efforts, tau):
+        """endeffector_force_filtered Tier1 필터의 관절공간 단계: 관절토크 잔차(측정 − 중력)
+        − tare → EMA 저역통과. 갱신된 _res_filt를 반환한다. 매핑(의사역) 성공 여부와 무관하게
+        매 사이클 호출해 필터 연속성을 유지한다(EE 힘 매핑은 _map_residual_to_force가 담당)."""
         r = np.asarray(efforts, dtype=float) - np.asarray(tau, dtype=float)
         if self._force_tare is not None and len(self._force_tare) == len(r):
             r = r - self._force_tare
-        # 2) EMA 저역통과(관절공간) — 매핑 실패와 무관하게 항상 갱신
         a = self._force_ema_alpha
         if self._res_filt is None or len(self._res_filt) != len(r):
             self._res_filt = r.copy()
         else:
             self._res_filt = a * r + (1.0 - a) * self._res_filt
-        # 3) damped 관성가중 의사역으로 EE 힘 매핑
-        try:
-            qnp = np.asarray(q, dtype=float)
-            J = pin.computeFrameJacobian(self.pin_model, self.pin_data, qnp,
-                                         self.ee_frame_id, pin.ReferenceFrame.LOCAL)
-            Jv = J[:3, :]
-            pin.crba(self.pin_model, self.pin_data, qnp)
-            M = np.triu(self.pin_data.M)
-            M = M + M.T - np.diag(np.diag(M))
-            Minv = np.linalg.inv(M)
-            A = Jv @ Minv @ Jv.T + (self.force_pinv_damping ** 2) * np.eye(3)   # damped LS
-            J_bar = Minv @ Jv.T @ np.linalg.inv(A)
-            F = J_bar.T @ self._res_filt
-        except np.linalg.LinAlgError:
-            return None
-        if not np.all(np.isfinite(F)):
-            return None
-        return F
+        return self._res_filt
 
     def _tare_ee_force_cb(self, request, response):
         """현재(필터된) 관절토크 잔차를 tare 오프셋으로 잡아 그 자세에서 filtered 힘을 0으로.
@@ -462,8 +454,11 @@ class NeroHardwareInterface(Node):
         t_grav = clk()
 
         # endeffector_force: 관성가중 토크-잔차로 추정한 EE 힘(EE 좌표). 특이점/모델없음 시 스킵.
+        # J/crba/inv(M)는 사이클당 한 번만(_ee_inertia_kinematics) 계산해 raw·filtered가 공유.
         if tau is not None and self.ee_frame_id is not None:
-            F_ee = self._estimate_ee_force(q, efforts, tau)
+            kin = self._ee_inertia_kinematics(q)
+            # raw: 측정−중력 잔차, 비감쇠 의사역(damping=0)
+            F_ee = self._map_residual_to_force(kin, np.asarray(efforts) - np.asarray(tau), 0.0)
             if F_ee is not None:
                 w = WrenchStamped()
                 w.header.stamp = msg.header.stamp
@@ -472,8 +467,9 @@ class NeroHardwareInterface(Node):
                 w.wrench.force.y = float(F_ee[1])
                 w.wrench.force.z = float(F_ee[2])
                 self.ee_force_pub.publish(w)
-            # Tier1 필터 적용본(EMA + tare + damped 의사역)
-            F_ee_f = self._estimate_ee_force_filtered(q, efforts, tau)
+            # Tier1 필터 적용본: 필터 상태는 매핑 실패와 무관하게 항상 갱신 → damped 의사역 매핑
+            res_f = self._update_force_filter(efforts, tau)
+            F_ee_f = self._map_residual_to_force(kin, res_f, self.force_pinv_damping)
             if F_ee_f is not None:
                 wf = WrenchStamped()
                 wf.header.stamp = msg.header.stamp
