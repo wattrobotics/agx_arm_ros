@@ -1,0 +1,53 @@
+# nero_hardware_interface 노드 파라미터(튜닝/거동).
+# 게인은 관절별 스칼라(런타임 per-joint `ros2 param set` 용이). 환경/구조 파라미터
+# (can_port, arm_type, auto_enable, 토픽명, urdf_path 등)는 launch 인자/노드 기본값으로 둔다.
+# /** : 네임스페이스 무관하게 매칭.
+/**:
+  ros__parameters:
+    # 평상시 제어
+    arm_control_mode: "move_mit"
+    pub_rate: 100
+    fast_mode: true
+    debug: false
+    speed_percent: 100
+    enable_timeout: 5.0
+
+    # MIT 임피던스 게인 (관절별)
+    mit_kp_1: 25.0
+    mit_kp_2: 25.0
+    mit_kp_3: 25.0
+    mit_kp_4: 25.0
+    mit_kp_5: 25.0
+    mit_kp_6: 25.0
+    mit_kp_7: 25.0
+    mit_kd_1: 0.8
+    mit_kd_2: 0.8
+    mit_kd_3: 0.8
+    mit_kd_4: 0.8
+    mit_kd_5: 0.8
+    mit_kd_6: 0.8
+    mit_kd_7: 0.8
+
+    # 중력보상 (관절별)
+    gravity_scale_1: 1.0
+    gravity_scale_2: 1.0
+    gravity_scale_3: 1.0
+    gravity_scale_4: 1.0
+    gravity_scale_5: 1.0
+    gravity_scale_6: 1.0
+    gravity_scale_7: 1.0
+    gravity_kd_1: 0.05
+    gravity_kd_2: 0.05
+    gravity_kd_3: 0.05
+    gravity_kd_4: 0.05
+    gravity_kd_5: 0.05
+    gravity_kd_6: 0.05
+    gravity_kd_7: 0.05
+
+    # 자동 drag 가드 (진입: 토크편차 / 탈출: settle)
+    auto_drag_guard_enabled: true
+    deviation_torque_threshold: 3.0
+    deviation_window_sec: 0.3
+    drag_auto_exit_enabled: true
+    settle_window_sec: 3.0
+    settle_still_deg: 5.0

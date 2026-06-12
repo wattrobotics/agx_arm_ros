@@ -33,8 +33,8 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Int32
 from geometry_msgs.msg import WrenchStamped
 from builtin_interfaces.msg import Time
-from std_srvs.srv import SetBool
-from controller_manager_msgs.srv import SwitchController
+from std_srvs.srv import SetBool, Trigger
+from controller_manager_msgs.srv import SwitchController, ListControllers
 from rcl_interfaces.msg import SetParametersResult
 from agx_arm_msgs.msg import AgxArmStatus, JointDriveState, JointDriveStateArray
 from pyAgxArm import create_agx_arm_config, AgxArmFactory, NeroFW
@@ -75,6 +75,8 @@ class NeroHardwareInterface(Node):
         self.declare_parameter("ee_frame", "end_point_link")
         self.declare_parameter("controller_manager_name", "controller_manager")
         self.declare_parameter("arm_controller_name", "arm_controller")
+        # drag 진입 시 비활성화 후보. 현재 active인 것만 끄고 탈출 시 그것만 복원(servo 모드면 servo_controller).
+        self.declare_parameter("drag_managed_controllers", ["arm_controller", "servo_controller"])
         for j in range(1, 8):
             self.declare_parameter(f"gravity_scale_{j}", 1.0)   # 0=무보상, 1=완전
         for j in range(1, 8):
@@ -99,6 +101,9 @@ class NeroHardwareInterface(Node):
         self.declare_parameter("servo_resync_on_drag", True)
         self.declare_parameter("servo_pause_service", "/servo_node/pause_servo")
         self.declare_parameter("servo_resume_settle_sec", 0.25)
+        # endeffector_force_filtered: Tier1 노이즈 저감 필터 파라미터
+        self.declare_parameter("force_filter_cutoff_hz", 4.0)   # 관절잔차 EMA 저역통과 컷오프(Hz, 낮을수록 강한 필터)
+        self.declare_parameter("force_pinv_damping", 0.01)      # damped 의사역 λ(특이점 노이즈 증폭 억제)
 
         self.can_port = self.get_parameter("can_port").value
         self.arm_type = self.get_parameter("arm_type").value
@@ -115,6 +120,7 @@ class NeroHardwareInterface(Node):
         self.ee_frame = self.get_parameter("ee_frame").value
         self.controller_manager_name = self.get_parameter("controller_manager_name").value
         self.arm_controller_name = self.get_parameter("arm_controller_name").value
+        self.drag_managed_controllers = list(self.get_parameter("drag_managed_controllers").value)
         self.gravity_scale = [self.get_parameter(f"gravity_scale_{j}").value for j in range(1, 8)]
         self.gravity_kd = [self.get_parameter(f"gravity_kd_{j}").value for j in range(1, 8)]
         self.mit_kp = [self.get_parameter(f"mit_kp_{j}").value for j in range(1, 8)]
@@ -128,6 +134,9 @@ class NeroHardwareInterface(Node):
         self.servo_resync_on_drag = self.get_parameter("servo_resync_on_drag").value
         self.servo_pause_service = self.get_parameter("servo_pause_service").value
         self.servo_resume_settle_sec = self.get_parameter("servo_resume_settle_sec").value
+        self.force_filter_cutoff_hz = self.get_parameter("force_filter_cutoff_hz").value
+        self.force_pinv_damping = self.get_parameter("force_pinv_damping").value
+        self._force_ema_alpha = self._compute_ema_alpha(self.force_filter_cutoff_hz)
 
         self.enable_flag = False
         # 실측을 1회 이상 수신해 발행을 시작했는지(= ROS1 innfos position_set 가드 역할).
@@ -137,12 +146,19 @@ class NeroHardwareInterface(Node):
         self.drag_mode_active = False
         self._block_forward = False
         self._was_drag = False
+        # 컨트롤러 전환(B안): 저율 폴링으로 캐시한 active managed 집합 / enter가 끈 목록(복원용)
+        self._active_managed = []
+        self._drag_deactivated = []
         # MIT 서보 목표(arm_joint_names 순서). _command_cb가 기록, 제어 타이머가 추종.
         self._last_cmd = None
         # 자동 drag 가드 상태
         self._dev_trip_since = None   # 편차 초과 시작 perf_counter 시각(진입 디바운스)
         self._settle_hist = []        # [(t, q), ...] 탈출 settle 슬라이딩 윈도우
         self._unblock_at = None       # drag 탈출 후 command 전달 재개 deadline(perf_counter)
+
+        # endeffector_force_filtered 상태: 관절잔차 EMA 누적값 / tare 오프셋(관절잔차 기준)
+        self._res_filt = None
+        self._force_tare = None
 
         self._init_arm()
         self._init_dynamics()
@@ -158,14 +174,23 @@ class NeroHardwareInterface(Node):
         self.is_drag_mode_pub = self.create_publisher(Int32, "feedback/is_drag_mode", 1)
         # endeffector_force: 관성가중 토크-잔차로 추정한 EE 힘(3D, EE 좌표). gc_ok+ee_frame 시 발행.
         self.ee_force_pub = self.create_publisher(WrenchStamped, "feedback/endeffector_force", 1)
+        # endeffector_force_filtered: 위 추정에 Tier1 필터(EMA + tare + damped 의사역) 적용본
+        self.ee_force_filtered_pub = self.create_publisher(
+            WrenchStamped, "feedback/endeffector_force_filtered", 1
+        )
         self.create_subscription(JointState, self.command_topic, self._command_cb, 1)
         self.create_service(SetBool, "drag_mode", self._drag_cb)
         self.create_service(SetBool, "auto_drag_guard", self._auto_drag_guard_cb)
+        self.create_service(Trigger, "tare_endeffector_force", self._tare_ee_force_cb)
         self._switch_cli = self.create_client(
             SwitchController, f"{self.controller_manager_name}/switch_controller"
         )
         # MoveIt Servo pause/resume 클라이언트. servo_node 미실행 시 호출 skip(블록 안 함).
         self._pause_cli = self.create_client(SetBool, self.servo_pause_service)
+        # 현재 active 컨트롤러 조회용. 저율 폴링으로 _active_managed 캐시(enter에서 동기 스냅샷).
+        self._list_cli = self.create_client(
+            ListControllers, f"{self.controller_manager_name}/list_controllers"
+        )
 
         # 제어 루프 = ROS 타이머. 블로킹 CAN(read/move_*)이 콜백(command/drag)을 막지 않도록
         # 전용 MutuallyExclusiveCallbackGroup에 두고 MultiThreadedExecutor로 돌린다(main 참고).
@@ -174,6 +199,8 @@ class NeroHardwareInterface(Node):
         self.create_timer(
             1.0 / self.pub_rate, self._control_tick, callback_group=self._control_cbg
         )
+        # active 컨트롤러 캐시 갱신(저율, default 그룹). drag 중엔 skip, control 루프와 분리(비블로킹).
+        self.create_timer(0.5, self._refresh_active_controllers)
         # 런타임 파라미터 변경(rqt / ros2 param set) 반영
         self.add_on_set_parameters_callback(self._on_set_params)
 
@@ -252,6 +279,70 @@ class NeroHardwareInterface(Node):
             return None                                     # 근처 특이 inf/nan → 스킵
         return F
 
+    def _compute_ema_alpha(self, fc):
+        """EMA 저역통과 계수 alpha = dt/(tau_c+dt), tau_c=1/(2π·fc), dt=1/pub_rate.
+        fc<=0이면 1.0(무필터). 컷오프↑ = alpha↑ = 덜 부드럽지만 위상 지연 적음."""
+        dt = 1.0 / max(1, int(self.pub_rate))
+        if fc <= 0.0:
+            return 1.0
+        tau_c = 1.0 / (2.0 * math.pi * fc)
+        return dt / (tau_c + dt)
+
+    def _estimate_ee_force_filtered(self, q, efforts, tau):
+        """raw 추정에 Tier1 필터 적용: 관절토크 잔차 − tare → EMA 저역통과 →
+        damped 관성가중 의사역으로 EE 힘(3D, EE 좌표) 매핑. None이면 그 사이클 스킵.
+        EMA 상태(_res_filt)는 매핑이 특이점으로 실패해도 갱신해 필터 연속성을 유지한다."""
+        if not (self._gc_ok and tau is not None and self.ee_frame_id is not None):
+            return None
+        # 1) 관절토크 잔차(측정 − 중력) − tare 오프셋
+        r = np.asarray(efforts, dtype=float) - np.asarray(tau, dtype=float)
+        if self._force_tare is not None and len(self._force_tare) == len(r):
+            r = r - self._force_tare
+        # 2) EMA 저역통과(관절공간) — 매핑 실패와 무관하게 항상 갱신
+        a = self._force_ema_alpha
+        if self._res_filt is None or len(self._res_filt) != len(r):
+            self._res_filt = r.copy()
+        else:
+            self._res_filt = a * r + (1.0 - a) * self._res_filt
+        # 3) damped 관성가중 의사역으로 EE 힘 매핑
+        try:
+            qnp = np.asarray(q, dtype=float)
+            J = pin.computeFrameJacobian(self.pin_model, self.pin_data, qnp,
+                                         self.ee_frame_id, pin.ReferenceFrame.LOCAL)
+            Jv = J[:3, :]
+            pin.crba(self.pin_model, self.pin_data, qnp)
+            M = np.triu(self.pin_data.M)
+            M = M + M.T - np.diag(np.diag(M))
+            Minv = np.linalg.inv(M)
+            A = Jv @ Minv @ Jv.T + (self.force_pinv_damping ** 2) * np.eye(3)   # damped LS
+            J_bar = Minv @ Jv.T @ np.linalg.inv(A)
+            F = J_bar.T @ self._res_filt
+        except np.linalg.LinAlgError:
+            return None
+        if not np.all(np.isfinite(F)):
+            return None
+        return F
+
+    def _tare_ee_force_cb(self, request, response):
+        """현재(필터된) 관절토크 잔차를 tare 오프셋으로 잡아 그 자세에서 filtered 힘을 0으로.
+        모델 오차/마찰 바이어스는 자세 의존이라, 작업 직전 무접촉·정지 자세에서 호출 권장."""
+        if not (self._gc_ok and self.ee_frame_id is not None):
+            response.success = False
+            response.message = "gravity model / ee_frame unavailable"
+            return response
+        if self._res_filt is None:
+            response.success = False
+            response.message = "no force sample yet (run loop first)"
+            return response
+        old = self._force_tare if self._force_tare is not None else np.zeros_like(self._res_filt)
+        # _res_filt = LPF(raw − old_tare) → 절대 잔차 ≈ _res_filt + old_tare
+        self._force_tare = (self._res_filt + old).copy()
+        self._res_filt = np.zeros_like(self._res_filt)      # 즉시 0으로(재수렴 불필요)
+        response.success = True
+        response.message = "endeffector_force_filtered tared (current pose -> zero)"
+        self.get_logger().info(response.message)
+        return response
+
     def _enable_arm(self, enable=True):
         start = time.time()
         while not (self.agx_arm.enable() if enable else self.agx_arm.disable()):
@@ -291,6 +382,11 @@ class NeroHardwareInterface(Node):
                 self.settle_window_sec = max(0.1, float(p.value))
             elif p.name == "settle_still_deg":
                 self.settle_still_deg = max(0.0, float(p.value))
+            elif p.name == "force_filter_cutoff_hz":
+                self.force_filter_cutoff_hz = max(0.0, float(p.value))
+                self._force_ema_alpha = self._compute_ema_alpha(self.force_filter_cutoff_hz)
+            elif p.name == "force_pinv_damping":
+                self.force_pinv_damping = max(0.0, float(p.value))
         return SetParametersResult(successful=True)
 
     ### 제어 타이머: read → 계산 → 제어 송신(drag/정상 분기) → feedback 발행.
@@ -367,6 +463,16 @@ class NeroHardwareInterface(Node):
                 w.wrench.force.y = float(F_ee[1])
                 w.wrench.force.z = float(F_ee[2])
                 self.ee_force_pub.publish(w)
+            # Tier1 필터 적용본(EMA + tare + damped 의사역)
+            F_ee_f = self._estimate_ee_force_filtered(q, efforts, tau)
+            if F_ee_f is not None:
+                wf = WrenchStamped()
+                wf.header.stamp = msg.header.stamp
+                wf.header.frame_id = self.ee_frame
+                wf.wrench.force.x = float(F_ee_f[0])
+                wf.wrench.force.y = float(F_ee_f[1])
+                wf.wrench.force.z = float(F_ee_f[2])
+                self.ee_force_filtered_pub.publish(wf)
 
         # 4. 제어 송신 (drag / 정상 분기)
         n = self.arm_joint_count
@@ -501,6 +607,28 @@ class NeroHardwareInterface(Node):
         req.strictness = SwitchController.Request.BEST_EFFORT
         return self._switch_cli.call_async(req)
 
+    def _refresh_active_controllers(self):
+        """저율 폴링: 현재 active인 managed 컨트롤러 집합을 _active_managed에 캐시.
+        drag 중엔 skip(끈 컨트롤러가 캐시를 비우지 않도록). 비동기 — 제어 루프를 안 막는다."""
+        if self.drag_mode_active:
+            return
+        if not self._list_cli.service_is_ready():
+            return
+        self._list_cli.call_async(ListControllers.Request()).add_done_callback(
+            self._on_list_controllers
+        )
+
+    def _on_list_controllers(self, future):
+        try:
+            resp = future.result()
+        except Exception:
+            return
+        managed = set(self.drag_managed_controllers)
+        # GIL 하 참조 대입은 원자적 → enter의 list() 스냅샷과 안전(_last_cmd와 동일 패턴)
+        self._active_managed = [
+            c.name for c in resp.controller if c.name in managed and c.state == "active"
+        ]
+
     def _set_servo_paused(self, paused):
         """MoveIt Servo의 pause_servo 토글(비블로킹). servo_node 미실행/미발견이면 skip(블록 안 함).
         unpause(false) 시 servo가 last_commanded_state_를 현재 자세로 리셋 → drag 후 점프 방지.
@@ -550,17 +678,21 @@ class NeroHardwareInterface(Node):
         return response
 
     def _enter_drag(self, reason):
-        """drag(중력보상) 진입: 명령전달 차단 → arm_controller 비활성화(실행 중 JTC goal abort)
-        → servo pause(있으면, 재동기화 준비) → 다음 cycle부터 중력보상 MIT. 수동/자동 공통."""
+        """drag(중력보상) 진입: 명령전달 차단 → 현재 active인 managed 컨트롤러 비활성화
+        (캐시 동기 스냅샷; servo 모드면 servo_controller가 stale 셋포인트 스트리밍을 멈춘다)
+        → servo pause(있으면) → 다음 cycle부터 중력보상 MIT. 수동/자동 공통."""
         self._block_forward = True
         self._unblock_at = None                # 진행 중이던 unblock 예약 취소
-        self._switch_controller(activate=[], deactivate=[self.arm_controller_name])
+        self._drag_deactivated = list(self._active_managed)   # enter 시점 active 스냅샷(복원용)
+        if self._drag_deactivated:
+            self._switch_controller(activate=[], deactivate=self._drag_deactivated)
         servo = self._set_servo_paused(True)   # servo 발행 중지(있으면)
         self.drag_mode_active = True
         self._dev_trip_since = None
         self._settle_hist = []
         self.get_logger().warn(
-            f"Drag ENTER ({reason})" + (" [servo paused]" if servo else "")
+            f"Drag ENTER ({reason}) [deact: {self._drag_deactivated or 'none'}]"
+            + (" [servo paused]" if servo else "")
         )
 
     def _exit_drag(self, reason):
@@ -573,9 +705,12 @@ class NeroHardwareInterface(Node):
         self.drag_mode_active = False
         self._settle_hist = []
         self._set_servo_paused(False)          # servo 재동기화(unpause); 없으면 skip
-        self._switch_controller(activate=[self.arm_controller_name], deactivate=[])
+        if self._drag_deactivated:
+            self._switch_controller(activate=self._drag_deactivated, deactivate=[])
+        restored = self._drag_deactivated
+        self._drag_deactivated = []
         self._unblock_at = time.perf_counter() + max(0.0, self.servo_resume_settle_sec)
-        self.get_logger().info(f"Drag EXIT ({reason})")
+        self.get_logger().info(f"Drag EXIT ({reason}) [react: {restored or 'none'}]")
 
     def _check_deviation_entry(self, efforts, tau):
         """NORMAL: 측정토크 vs 중력모델 편차가 임계를 window초 지속하면 자동 drag 진입(True 반환)."""

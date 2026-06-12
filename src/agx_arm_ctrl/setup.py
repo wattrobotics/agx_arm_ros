@@ -17,6 +17,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
+        (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -29,7 +30,7 @@ setup(
         'console_scripts': [
             'agx_arm_ctrl_single = agx_arm_ctrl.agx_arm_ctrl_single_node:main',
             'agx_arm_ctrl_simple = agx_arm_ctrl.agx_arm_ctrl_simple_node:main',
-            'agx_arm_ctrl_simple_teleop = agx_arm_ctrl.agx_arm_ctrl_simple_teleop_node:main',
+            'agx_arm_ctrl_teleop_with_move_p = agx_arm_ctrl.agx_arm_ctrl_teleop_with_move_p_node:main',
             'agx_arm_ctrl_servo_teleop = agx_arm_ctrl.agx_arm_ctrl_servo_teleop_node:main',
             'nero_hardware_interface = agx_arm_ctrl.nero_hardware_interface:main',
         ],
