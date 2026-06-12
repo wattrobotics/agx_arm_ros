@@ -22,6 +22,15 @@ drag(중력보상) 모드(수동, 서비스 트리거):
 토픽 메시지 타입은 sensor_msgs/JointState (joint_state_topic_hardware_interface/JointStateTopicSystem).
 토픽 이름은 ros2_control xacro의 joint_commands_topic / joint_states_topic 과 일치해야 한다.
 """
+import os
+# Pinocchio/eigenpy(cmeel)·numpy(OpenBLAS)가 OpenMP로 빌드돼 있어, 미설정 시 코어 수만큼
+# 스레드풀을 띄우고 parallel region 사이를 active(spin) wait로 돈다. 100Hz 제어 루프가 매
+# 사이클 crba/jacobian/gravity를 호출하므로 풀이 잠들 틈 없이 계속 spin → 수 코어를 태운다.
+# 7-DOF 작은 행렬에선 멀티스레딩이 이득이 없고 오히려 느리다(실측 51.8→18.6us). 단일 스레드로
+# 고정해 spin 제거 + 연산 가속. libgomp는 import 시 env를 읽으므로 numpy/pinocchio import보다 위.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 import time
 import math
 import rclpy
